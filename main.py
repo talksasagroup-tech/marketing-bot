@@ -3,6 +3,9 @@
   python main.py init                    create the database
   python main.py scrape companies.csv    find emails on company websites
   python main.py discover [category] [--max N]   search the web for new leads
+  python main.py import lenders|microfinance [PDF]   add every lender or microfinance bank in a CBK directory
+  python main.py import names FILE --industry sacco --source "SASRA 2026" [--max N]
+                                         look up a register's names (one per line) on the web
   python main.py verify                  check email domains
   python main.py personalise [--limit N] write a personal opening for verified leads from their websites
   python main.py rank                    top 20 waiting leads in sending order, with start year and score
@@ -56,6 +59,21 @@ def main():
             max_new = int(args[i + 1])
             del args[i:i + 2]
         discover.run(args[0] if args else None, max_new)
+    elif cmd == "import":
+        import targeting
+        kind = args.pop(0) if args else ""
+        if kind == "lenders":
+            targeting.import_lenders(args[0] if args else targeting.CBK_DCP_URL)
+        elif kind == "microfinance":
+            targeting.import_microfinance(args[0] if args else targeting.CBK_MFB_URL)
+        elif kind == "names":
+            industry, source = targeting.take_option(args, "--industry"), targeting.take_option(args, "--source")
+            limit = take_number(args, "--max")
+            if not args or not industry or not source:
+                sys.exit('Usage: python main.py import names FILE --industry sacco --source "SASRA 2026"')
+            targeting.import_names(args[0], industry, source, limit)
+        else:
+            sys.exit("Usage: python main.py import lenders|microfinance [PDF]  or  import names FILE ...")
     elif cmd == "auto":
         import auto
         auto.run()

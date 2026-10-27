@@ -338,6 +338,27 @@ def company_name(title, domain):
     return (parts[0] if parts else domain)[:120]
 
 
+# Words every SACCO or insurer has in its name, so they can't show a site is the one named
+COMMON_NAME_WORDS = {"sacco", "saccos", "society", "societies", "savings", "credit", "cooperative", "co",
+                     "operative", "insurance", "assurance", "reinsurance", "general", "life", "company",
+                     "microfinance", "bank", "group", "and", "of", "the", "limited", "ltd", "plc", "kenya",
+                     "brokers", "broker", "agency", "agencies", "investment", "investments", "services"}
+
+
+def name_words(name):
+    """The distinctive words of an organisation's name: "Stima Sacco Society Ltd" gives {"stima"}."""
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", (name or "").lower())
+                     if w not in COMMON_NAME_WORDS and len(w) >= 3)
+
+
+def looks_like(name, title, domain):
+    """Whether a site's title or domain has a distinctive word from `name`: for "Stima Sacco
+    Society Ltd", "stima" in "stimasacco.com" or "Stima DT Sacco | Home"."""
+    words = name_words(name)
+    where = f"{title or ''} {domain}".lower()
+    return any(w in where for w in words)
+
+
 def look_at(url):
     """Fetch the homepage. Returns (title, mentions_kenya) or None if unreachable."""
     try:
@@ -372,9 +393,11 @@ def save_csv(row):
         w.writerow(row)
 
 
-def consider(url, category, query, seen):
+def consider(url, category, query, seen, name=None):
     """Visit one company site and add it as a lead if it qualifies.
-    Returns the new lead's row, or None."""
+    `name` is the organisation being looked for (a name from a register): the site is skipped
+    unless its title or domain shares a distinctive word with that name, and the lead gets
+    that name rather than the page title. Returns the new lead's row, or None."""
     domain = domain_of(url)
     if domain in seen or skip_domain(domain):
         return None
@@ -386,7 +409,7 @@ def consider(url, category, query, seen):
     title, mentions_kenya = page
     if not (domain.endswith(".ke") or mentions_kenya):
         return None
-    reason = skip_title(title, category)
+    reason = skip_title(title, category) or (name and not looks_like(name, title, domain) and f"not {name}")
     if reason:
         print(f"    {domain}: skipped ({reason})")
         return None
@@ -398,7 +421,7 @@ def consider(url, category, query, seen):
     if db.blocked(email):
         print(f"    {domain}: {email} is on the suppression list")
         return None
-    name = company_name(title, domain)
+    name = name or company_name(title, domain)
     # held for a person to confirm its industry: the search that found it is only a guess
     phone = scraper.pick_phone(phones)
     if not db.add_lead(name, domain, category, email, "search", query, url, review_status="pending",

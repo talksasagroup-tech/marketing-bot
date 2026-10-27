@@ -6,6 +6,14 @@ Nothing here sends email.
       in industry digital_lender. Without a path the September 2026 directory is downloaded.
       A lead whose email, company name or own email domain is already in leads is skipped. Each new address
       gets the same check as `main.py verify` (MX record), so it ends up verified or invalid.
+  python targeting.py import-microfinance [PDF path or URL] [--source NAME] [--source-url URL]
+      the same for the CBK directory of licensed microfinance banks (industry microfinance).
+  python targeting.py import-names FILE --industry NAME --source NAME [--max N]
+      for registers that list names only (SASRA's licensed SACCOs, IRA's licensed insurers,
+      both published in the Kenya Gazette): FILE has one organisation per line. Each name not
+      already a lead is searched for on the web, and its website goes through the same checks
+      as `main.py discover`. Leads found this way wait in the CRM's To review queue, where a
+      person checks the website really is that organisation's.
   python targeting.py swap-emails
       for imported leads whose address is a legal@, compliance@, report..@, accounts@ or
       finance@ inbox or a person's: looks on their website for info@, hello@, sales@ or
@@ -20,7 +28,7 @@ Nothing here sends email.
       couldn't be read; --md also writes it as a Markdown file
 
 The sender emails the highest need score first and leaves leads below MIN_SCORE (.env)
-waiting. digital_lender is approved in uses.yaml and sends the fintech templates.
+waiting. A lead in an industry that uses.yaml doesn't approve waits until it is approved.
 """
 import io
 import json
@@ -45,10 +53,15 @@ CBK_DCP_URL = ("https://www.centralbank.go.ke/wp-content/uploads/2026/09/"
                "Directory-of-Digital-Credit-Providers-September-2026.pdf")
 CBK_DCP_SOURCE = "CBK DCP directory Sep 2026"
 INDUSTRY = "digital_lender"
+CBK_MFB_URL = ("https://www.centralbank.go.ke/wp-content/uploads/2026/02/"
+               "Directory-of-Licenced-Microfinance-Banks-Feb-2026.pdf")
+CBK_MFB_SOURCE = "CBK microfinance bank directory Feb 2026"
+# A lead from a regulator's register is a real, licensed organisation of the kind we sell to
+REGISTERED = 10
 
-# Page headers and footers repeated on every page of the directory, and bare page numbers
-PAGE_JUNK = re.compile(r"^(?:CENTRAL BANK OF KENYA|DIRECTORY OF DIGITAL CREDIT PROVIDERS|"
-                       r"UPDATED ON .*|C2: CBK - Official|\d+)$")
+# Page headers and footers repeated on every page of a CBK directory, and page numbers
+PAGE_JUNK = re.compile(r"^(?:CENTRAL BANK OF KENYA|(?:NO\.\s+)?DIRECTORY OF .*|"
+                       r"UPDATED ON .*|C2: CBK - Official|Page \d+ of \d+|\d+)$")
 ENTRY = re.compile(r"^(\d+)\.\s+(.+)$")
 # The label each line starts with. Spellings vary ("E-mail address:", "Telephone No:",
 # "Physical Location:", "Telephone+254..." with no colon); a line with no label continues
@@ -58,8 +71,9 @@ LABELS = [
     ("phone", re.compile(r"^Telephone(?:\s+No\.?|\s+Number)?\s*:?\s*-?", re.I)),
     ("email", re.compile(r"^(?:Official\s+)?E-?mail(?:\s+address)?\s*:", re.I)),
     ("address", re.compile(r"^Physical\s+(?:Address|Location)\s*:", re.I)),
-    ("licensed", re.compile(r"^(?:Date\s+)?Licensed\s*:", re.I)),
-    ("other", re.compile(r"^L\.R\s*NO\s*:", re.I)),
+    ("licensed", re.compile(r"^(?:Date\s+)?Licen[sc]ed\s*:", re.I)),
+    ("website", re.compile(r"^Website\s*:", re.I)),
+    ("other", re.compile(r"^(?:L\.R\s*NO|Fax|Branches)\s*:", re.I)),
 ]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 # Words left out when comparing company names, so "Zenka Digital Ltd" matches "Zenka Digital Limited"
@@ -71,12 +85,24 @@ CREATE TABLE IF NOT EXISTS import_runs (
     id INTEGER PRIMARY KEY,
     source TEXT,
     source_url TEXT,
+    industry TEXT,
     run_at TEXT DEFAULT CURRENT_TIMESTAMP,
     found INTEGER,
     -- JSON: added (lead ids), duplicates, missing_email, suppressed, invalid (lead ids)
     result TEXT
 );
 """
+
+
+def runs_table(c):
+    c.executescript(RUNS_SCHEMA)
+    if "industry" not in db.columns(c, "import_runs"):  # made before other directories were imported
+        c.execute("ALTER TABLE import_runs ADD COLUMN industry TEXT")
+
+
+def run_industry(run):
+    """The industry a run's leads went into; runs from before this was recorded were all lenders."""
+    return (run["industry"] if "industry" in run.keys() else None) or INDUSTRY
 
 
 def pdf_text(data):
@@ -100,7 +126,7 @@ def parse_directory(text):
     for line in text.splitlines():
         line = " ".join(line.split())
         # a label run onto the end of the line before it ("Nairobi, KenyaDate Licensed: ...")
-        for part in re.split(r"(?=Date\s+Licensed\s*:)", line):
+        for part in re.split(r"(?=Date\s+Licen[sc]ed\s*:)", line):
             if not part or PAGE_JUNK.match(part):
                 continue
             m = ENTRY.match(part)
@@ -124,16 +150,21 @@ def parse_directory(text):
 def clean(entry):
     emails = list(dict.fromkeys(e.lower() for e in EMAIL.findall(entry.get("email", ""))))
     address = re.sub(r"^Physical\s+Address\s*[.:]\s*", "", entry.get("address", ""), flags=re.I)
-    phone = entry.get("phone", "").strip(" :-")
-    if phone.startswith("254"):
+    phone = entry.get("phone", "").strip(" :-–")
+    # "+254 - 020 - 3877290/3/7; 0711 - 074074": the best number in the list, else the text as it is
+    numbers = [n for n in map(scraper.phone_number, re.split(r"[,/;|]", phone)) if n]
+    if numbers:
+        phone = scraper.pick_phone(numbers)
+    elif phone.startswith("254"):
         phone = "+" + phone
     email = pick_email(emails)
+    listed = (entry.get("website") or "").strip(" ;,")
     return {
         "number": entry["number"],
         "name": entry["name"].strip(" .,"),
         "emails": emails,
         "email": email,
-        "website": website_of(email),
+        "website": (ranking.urlparse_domain(listed) if listed else None) or website_of(email),
         "phone": phone or None,
         "address": address.strip() or None,
         "licensed": iso_date(entry.get("licensed", "")),
@@ -167,7 +198,7 @@ def website_of(email):
 def iso_date(text):
     """'April 10, 2026' as '2026-04-10'. Text that isn't a date is kept as it is."""
     text = text.strip(" .")
-    for fmt in ("%B %d, %Y", "%B %d %Y", "%d %B %Y", "%d %B, %Y"):
+    for fmt in ("%B %d, %Y", "%B %d %Y", "%d %B %Y", "%d %B, %Y", "%d.%m.%Y"):
         try:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
@@ -200,13 +231,28 @@ def fetch(src):
 
 
 def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_URL):
+    import_directory(src, INDUSTRY, source, source_url)
+
+
+def import_microfinance(src=CBK_MFB_URL, source=CBK_MFB_SOURCE, source_url=CBK_MFB_URL):
+    import_directory(src, "microfinance", source, source_url)
+
+
+def import_directory(src, industry, source, source_url):
+    """Every entry in a CBK directory PDF becomes a lead in `industry` (see import-lenders)."""
     entries = parse_directory(pdf_text(fetch(src)))
     if not entries:
         raise SystemExit(f"No entries found in {src}.")
+    import_entries(entries, industry, source, source_url)
+
+
+def import_entries(entries, industry, source, source_url):
+    """Add directory entries (parse_directory's dicts) as leads: skip the ones already leads
+    or opted out, check each new address's domain takes mail, and record the run."""
     db.init()
     added, duplicates, missing, suppressed = [], [], [], []
     with db.conn() as c:
-        c.executescript(RUNS_SCHEMA)
+        runs_table(c)
         by_email, by_name, by_domain = {}, {}, {}
         for lead in c.execute("SELECT id, company, email, website FROM leads"):
             if lead["email"]:
@@ -237,7 +283,7 @@ def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_UR
                 "INSERT INTO leads (company, website, industry, email, phone, physical_address,"
                 " date_licensed, source, source_url, discovered_at, imported_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id",
-                (e["name"], e["website"], INDUSTRY, e["email"], e["phone"], e["address"],
+                (e["name"], e["website"], industry, e["email"], e["phone"], e["address"],
                  e["licensed"], source, source_url)).fetchone()[0]
             db.log_event(c, lead_id, "discovered", source=source, url=source_url)
             added.append(lead_id)
@@ -261,19 +307,62 @@ def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_UR
     result = {"added": added, "duplicates": duplicates, "missing_email": missing,
               "suppressed": suppressed, "invalid": invalid}
     with db.conn() as c:
-        c.execute("INSERT INTO import_runs (source, source_url, found, result) VALUES (?,?,?,?)",
-                  (source, source_url, len(entries), json.dumps(result, ensure_ascii=False)))
+        c.execute("INSERT INTO import_runs (source, source_url, industry, found, result) VALUES (?,?,?,?,?)",
+                  (source, source_url, industry, len(entries), json.dumps(result, ensure_ascii=False)))
     print(f"Found {len(entries)}, added {len(added)} ({len(invalid)} invalid), "
           f"skipped {len(duplicates)} duplicates, {len(missing)} with no email"
           + (f", {len(suppressed)} opted out" if suppressed else "") + ".")
     swap_emails()
 
 
+def read_names(path):
+    """The organisations in a names file: one per line, any "12." numbering and blank lines ignored."""
+    with open(path, encoding="utf-8-sig") as f:
+        lines = [re.sub(r"^\s*\d+[.)]?\s+", "", line.strip()).strip(" \t.,") for line in f]
+    return list(dict.fromkeys(n for n in lines if n))
+
+
+def import_names(path, industry, source, limit=None):
+    """Look up each named organisation on the web and add the ones found (see import-names).
+    Returns (added rows, names not found)."""
+    import discover
+    import websearch
+    db.init()
+    names = read_names(path)
+    # "Mwalimu National Sacco" is "Mwalimu National Sacco Society Ltd" on the register
+    with db.conn() as c:
+        known = {discover.name_words(company) for (company,) in c.execute("SELECT company FROM leads")} - {frozenset()}
+    seen = discover.known_domains()
+    added, not_found, already = [], [], 0
+    for name in names:
+        if limit and len(added) >= limit:
+            break
+        if discover.name_words(name) in known:
+            already += 1
+            continue
+        print(f"  {name}")
+        row = None
+        for res in websearch.search(f'"{name}" Kenya contact', 5):
+            row = discover.consider(res.get("href") or "", industry, f"named in {source}", seen, name=name)
+            if row:
+                break
+        if row:
+            added.append(row)
+            known.add(discover.name_words(name))
+        else:
+            not_found.append(name)
+    print(f"{len(names)} names: added {len(added)}, {already} already leads, {len(not_found)} not found."
+          + (" Check the new ones in the CRM's To review." if added else ""))
+    if not_found:
+        print("Not found (no website with an email, or none that looks like theirs):\n  " + "\n  ".join(not_found))
+    return added, not_found
+
+
 def last_run():
     """(run, result, added leads) for the last import, or None if nothing was imported."""
     db.init()
     with db.conn() as c:
-        c.executescript(RUNS_SCHEMA)
+        runs_table(c)
         run = c.execute("SELECT * FROM import_runs ORDER BY id DESC LIMIT 1").fetchone()
         if not run:
             return None
@@ -389,9 +478,9 @@ def import_markdown(run, result, added, table):
     counts = import_counts(run, result, added)
     by_id = {l["id"]: l for l in added}
     parts = [
-        f"## Digital lender import: {run['source']}",
+        f"## Directory import: {run['source']}",
         f"Imported {run['run_at']} UTC into `{config.DB_PATH}` from {run['source_url']}.\n\n"
-        f"Every lead is in industry `{INDUSTRY}`.",
+        f"Every lead is in industry `{run_industry(run)}`.",
         table(["", "Count"], counts),
         f"### First {min(20, len(added))} added",
         table(["Lead", "Company", "Email", "Status", "Website", "Phone", "Licensed"],
@@ -568,9 +657,10 @@ def unreadable_sites():
 
 # --- Need score ---
 # 0-100 from fixed rules. Digital lenders start at 50; every other industry at 40 and gains
-# 10 for each sign on its website that it messages many people. A website that can't be
-# read gives 10 instead of what reading it might have.
-SCORE_VERSION = 3  # 1 was ranking.py's old points; raise this when the rules below change
+# 10 for each sign on its website that it messages many people, and 10 for being on a
+# regulator's register (imported from a CBK directory). A website that can't be read gives
+# 10 instead of what reading it might have.
+SCORE_VERSION = 4  # 1 was ranking.py's old points; raise this when the rules below change
 LENDER_START, OTHER_START = 50, 40
 SITE_WORKERS = 8  # websites read at the same time
 # A website that can't be read even as a browser: it may still be a busy lender's, so it
@@ -614,6 +704,8 @@ def need_score(lead, text):
             points.append((-30, "email invalid"))
     else:
         points.append((OTHER_START, f"start ({lead.get('industry') or 'no industry'})"))
+        if lead.get("imported_at"):
+            points.append((REGISTERED, f"on a regulator's register ({lead.get('source') or 'directory'})"))
         for pattern, why in ((SMS_ALERTS, "SMS alerts"), (MPESA, "M-Pesa or paybill"),
                              (BRANCHES, "branches"), (COUNT, "how many members, students or customers"),
                              (APP, "an app"), (PORTAL, "a portal")):
@@ -697,6 +789,15 @@ if __name__ == "__main__":
         source = take_option(args, "--source") or CBK_DCP_SOURCE
         source_url = take_option(args, "--source-url") or CBK_DCP_URL
         import_lenders(args[0] if args else CBK_DCP_URL, source, source_url)
+    elif cmd == "import-microfinance":
+        source = take_option(args, "--source") or CBK_MFB_SOURCE
+        source_url = take_option(args, "--source-url") or CBK_MFB_URL
+        import_microfinance(args[0] if args else CBK_MFB_URL, source, source_url)
+    elif cmd == "import-names":
+        industry, source, limit = take_option(args, "--industry"), take_option(args, "--source"), take_option(args, "--max")
+        if not args or not industry or not source:
+            raise SystemExit("Usage: python targeting.py import-names FILE --industry sacco --source \"SASRA 2026\"")
+        import_names(args[0], industry, source, int(limit) if limit else None)
     elif cmd == "swap-emails":
         print(f"Swapped {swap_emails()} emails.")
     elif cmd == "score":
