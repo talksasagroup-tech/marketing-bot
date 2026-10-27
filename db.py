@@ -87,7 +87,10 @@ CREATE TABLE IF NOT EXISTS sent (
     sent_at TEXT,
     -- exactly what went out: the subject and the plain-text body
     sent_subject TEXT,
-    sent_body TEXT
+    sent_body TEXT,
+    -- template, personal, followup or followup2; and which subject line a first email used
+    variant TEXT,
+    subject_no INTEGER
 );
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY,
@@ -325,7 +328,8 @@ def init():
         c.executescript(SCHEMA)
         # Databases made before these columns existed: add them, leave the rows alone
         for table, col, kind in (("sent", "sent_subject", "TEXT"), ("sent", "sent_body", "TEXT"),
-                                 ("sent", "sent_at", "TEXT"),
+                                 ("sent", "sent_at", "TEXT"), ("sent", "variant", "TEXT"),
+                                 ("sent", "subject_no", "INTEGER"),
                                  ("leads", "opener", "TEXT"), ("leads", "use_case", "TEXT"), ("leads", "subject_topic", "TEXT"),
                                  ("leads", "uses", "TEXT"),
                                  ("leads", "confidence", "REAL"), ("leads", "est_year", "INTEGER"),
@@ -486,14 +490,16 @@ def find_lead_by_email(email):
     with conn() as c:
         return c.execute("SELECT * FROM leads WHERE email=?", (email.lower(),)).fetchone()
 
-def record_sent(lead_id, message_id, template, subject=None, body=None, subject_variant=None):
+def record_sent(lead_id, message_id, template, subject=None, body=None, subject_variant=None, subject_no=None):
     """Record an email that went out. Its send claim, if any, is removed in the same
-    transaction, so the email counts once towards the daily limit."""
+    transaction, so the email counts once towards the daily limit. subject_no is which of
+    the template's subject lines a first email used (1, 2, ...), for the subject test."""
     with conn() as c:
         c.execute("DELETE FROM send_claims WHERE lead_id=?", (lead_id,))
         sent_id = c.execute("INSERT INTO sent (lead_id, message_id, template, sent_subject, sent_body,"
-                            " sent_on, sent_at) VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP) RETURNING id",
-                            (lead_id, message_id, template, subject, body, today())).fetchone()[0]
+                            " variant, subject_no, sent_on, sent_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) RETURNING id",
+                            (lead_id, message_id, template, subject, body, subject_variant, subject_no,
+                             today())).fetchone()[0]
         step = c.execute("SELECT COUNT(*) FROM sent WHERE lead_id=?", (lead_id,)).fetchone()[0]
         # the campaign is the niche template the email was built from
         log_event(c, lead_id, "email_sent", sent_id=sent_id, step=step, subject=subject,

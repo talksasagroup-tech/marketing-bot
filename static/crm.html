@@ -200,6 +200,8 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .tpl-head p { font-size: 12.5px; margin-top: 2px; }
 .tpl-head .tab { flex: none; padding: 0 12px; }
 .tab[disabled] { opacity: .4; cursor: default; }
+.textarea.tpl-subjects { min-height: 0; }
+.tpl-sub-hint { display: block; margin-top: 4px; font-size: 12px; font-weight: 400; color: var(--fg-3); }
 .textarea.mono { font-family: var(--mono); font-size: 12.5px; line-height: 1.65; min-height: 200px; }
 .gaps { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .gap { height: 24px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--primary-line); background: var(--primary-soft);
@@ -824,7 +826,8 @@ function renderTplEditor(t) {
       <div class="tabs" role="tablist">${Object.keys(KIND_NAMES).map(k => `<button class="tab" role="tab" data-kind="${k}" aria-selected="${k === d.kind}"
         ${t.kinds.includes(k) ? "" : `disabled title="This industry has no ${KIND_NAMES[k].toLowerCase()}"`}>${KIND_NAMES[k]}</button>`).join("")}</div></div>
     <div class="formgrid">
-      ${d.kind === "first" ? `<label class="full">Subject <input class="input" id="tpl-subject" value="${esc(d.subject)}" maxlength="150"></label>`
+      ${d.kind === "first" ? `<label class="full">Subject <textarea class="textarea tpl-subjects" id="tpl-subject" rows="2">${esc(d.subject)}</textarea>
+          <span class="tpl-sub-hint">One subject per line. With two or three, each company gets one of them, and What's working shows which brings more replies.</span></label>`
         : `<p class="full hint">Follow-ups go out as a reply in the same thread: the subject is "Re: " and the first email's subject, and no PDF is attached.</p>`}
       <label class="full">Email text <textarea class="textarea mono" id="tpl-body" rows="${Math.min(30, d.body.split("\n").length + 2)}">${esc(d.body)}</textarea></label>
       <div class="full gaps"><span class="hint">Gaps LeadBot fills in. Click one to add it where the cursor is:</span>
@@ -1404,6 +1407,19 @@ function repTable(title, note, items, minSample) {
       <td><span class="rate ${i.small_sample ? "small" : ""}"><span class="tnum">${pct(i.reply_rate)}</span><span class="track"><i style="width:${Math.round(100 * (i.reply_rate || 0) / max)}%"></i></span>${i.small_sample ? `<span class="small-note">too few to judge</span>` : ""}</span></td>
       <td class="tnum">${i.interested}</td><td class="tnum">${i.meetings}</td><td class="tnum">${i.clients}</td></tr>`).join("")}</tbody></table></div></div>`;
 }
+function hoursText(h) {
+  if (h == null) return "–";
+  return h < 1 ? Math.max(1, Math.round(h * 60)) + " min" : h < 48 ? h + " h" : Math.round(h / 24) + " days";
+}
+function answerPanel(a) {
+  if (!a || (!a.answered && !a.waiting)) return "";
+  return `<div class="panel"><h3>How fast we answer</h3><p class="lead2">Replies where the client is interested or asks a question, until our first email back from the CRM. Answers by phone or from webmail don't show here.</p>
+    <div class="rep-sum" style="padding:0 16px 16px">
+      <div class="kpi"><span>Typical time to answer</span><b>${hoursText(a.median_hours)}</b></div>
+      <div class="kpi"><span>Answered within 2 hours</span><b>${a.within_2h} of ${a.answered}</b></div>
+      <div class="kpi"><span>Still waiting for an answer</span><b>${a.waiting}</b></div>
+    </div></div>`;
+}
 function lostTable(items) {
   if (!items || !items.length) return "";
   const total = items.reduce((n, i) => n + i.n, 0);
@@ -1438,7 +1454,9 @@ async function loadReport() {
       </div>
       <p class="muted" style="font-size:12.5px;margin:-8px 0 16px">Reply rate = organisations that replied ÷ those whose email didn't bounce. Auto-replies don't count. A group needs at least ${d.min_sample} delivered emails before its rate means much.</p>
       <div style="display:grid;gap:16px">
+        ${answerPanel(d.answer_time)}
         ${repTable("By industry", "", d.groups.segment)}
+        ${repTable("By template and subject", "Each first email by the template it came from. A template with two or three subject lines shows each subject on its own row, so you can keep the one that brings more replies.", d.groups.template)}
         ${d.has_scores ? repTable("By need score", "If the scoring works, higher bands should reply more. If they don't, the rules need changing.", d.groups.score) : `<div class="panel"><h3>By need score</h3><p class="lead2" style="padding-bottom:14px">No scores yet. They appear once the targeting step has scored your leads.</p></div>`}
         ${d.has_source ? repTable("By where the lead came from", "", d.groups.source) : ""}
         ${lostTable(d.lost_reasons)}

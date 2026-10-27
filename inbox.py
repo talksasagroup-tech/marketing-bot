@@ -181,8 +181,9 @@ TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 def outreach_subjects():
     """The subjects our emails go out with: every template's, and every one recorded as sent."""
-    subjects = {path.read_text(encoding="utf-8").split("\n", 1)[0].replace("Subject:", "").strip()
-                for path in TEMPLATE_DIR.glob("*.txt")}
+    import sender
+    subjects = {s for path in TEMPLATE_DIR.glob("*.txt")
+                for s in sender.split_template(path.read_text(encoding="utf-8"))[0]}
     return {s.lower() for s in subjects | db.sent_subjects() if s}
 
 

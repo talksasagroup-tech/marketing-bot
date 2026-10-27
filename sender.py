@@ -75,16 +75,46 @@ def attachment():
     return path
 
 
-def load_template(industry):
-    """Use templates/<industry>.txt if it exists, otherwise templates/default.txt.
-    First line is the subject, the rest is the body. The body is fixed text apart from
-    {opener} and {uses}, which personalise.py fills for each lead."""
+def split_template(text):
+    """(subjects, body) of a first-email template: one or more "Subject:" lines, then the body.
+    More than one subject line is a test: each lead gets one of them (subject_for), and the
+    report shows which subject brings more replies."""
+    lines = text.split("\n")
+    subjects = []
+    while lines and lines[0].startswith("Subject:"):
+        subjects.append(lines.pop(0).replace("Subject:", "", 1).strip())
+    return subjects, "\n".join(lines).strip()
+
+
+def load_templates(industry):
+    """(name, subjects, body) from templates/<industry>.txt if it exists, otherwise
+    templates/default.txt. The body is fixed text apart from {opener} and {uses}, which
+    personalise.py fills for each lead."""
     name = (industry or "default").lower().replace(" ", "_")
     path = TEMPLATE_DIR / f"{name}.txt"
     if not path.exists():
         path, name = TEMPLATE_DIR / "default.txt", "default"
-    subject, body = path.read_text(encoding="utf-8").split("\n", 1)
-    return name, subject.replace("Subject:", "").strip(), body.strip()
+    subjects, body = split_template(path.read_text(encoding="utf-8"))
+    return name, subjects, body
+
+
+def load_template(industry):
+    """(name, subject, body), with the template's first subject."""
+    name, subjects, body = load_templates(industry)
+    return name, subjects[0], body
+
+
+def subject_for(lead, subjects):
+    """(number, subject): which of a template's subjects this lead gets, counting from 1.
+    It depends only on the lead, so the same lead always gets the same one."""
+    n = (dict(lead).get("id") or 0) % len(subjects)
+    return n + 1, subjects[n]
+
+
+def subject_number(lead, subject):
+    """Which of its template's subjects an email to this lead went out with, or None."""
+    _, subjects, _ = load_templates(lead["industry"])
+    return next((i for i, s in enumerate(subjects, 1) if _same_subject(fill(s, lead), subject)), None)
 
 
 def fill(text, lead, attached=False, for_html=False, extra=None):
@@ -134,7 +164,8 @@ def to_html(text):
 
 def build(lead):
     """The first email to a lead: its industry's template, with the PDF if there is one."""
-    tname, subject, body = load_template(lead["industry"])
+    tname, subjects, body = load_templates(lead["industry"])
+    _, subject = subject_for(lead, subjects)
     return compose(lead, fill(subject, lead), body, attachment()), tname
 
 
@@ -209,13 +240,13 @@ def _same_subject(a, b):
 
 def old_wording(lead, thread):
     """Whether the lead's first email went out with older wording than its industry's
-    template has now: its saved subject differs from the template's subject, or no subject
+    template has now: its saved subject is none of the template's subjects, or no subject
     was saved (emails from before subjects were recorded, so the wording is unknown).
     `thread` is db.sent_thread for the lead; a lead never emailed has no old wording."""
     if not thread:
         return False
     saved = thread[0]["sent_subject"]
-    return not saved or not _same_subject(saved, fill(load_template(lead["industry"])[1], lead))
+    return not saved or subject_number(lead, saved) is None
 
 
 def build_followup(lead, n=1):
@@ -235,7 +266,7 @@ def build_followup(lead, n=1):
             raise RuntimeError(f"{path} doesn't contain the line to swap for old-wording leads: {FOLLOWUP1_LINE!r}")
         body = body.replace(FOLLOWUP1_LINE, OLD_WORDING_LINE)
     first_subject = ((thread[0]["sent_subject"] if thread else lead.get("sent_subject"))
-                     or fill(load_template(lead["industry"])[1], lead))
+                     or fill(subject_for(lead, load_templates(lead["industry"])[1])[1], lead))
     subject = first_subject if first_subject.lower().startswith("re:") else f"Re: {first_subject}"
     ids = [r["message_id"] for r in thread if r["message_id"]] or [lead.get("message_id")]
     ids = [i for i in ids if i]
@@ -364,7 +395,8 @@ def deliver(smtp, lead, msg, tname, followup=0):
     sent_at = time.time()
     variant = ("followup" if followup == 1 else f"followup{followup:d}" if followup
                else "personal" if personalise.picked_uses(lead) else "template")
-    db.record_sent(lead["id"], msg["Message-ID"], tname, str(msg["Subject"]), plain_of(msg), variant)
+    subject_no = None if followup else subject_number(lead, str(msg["Subject"]))
+    db.record_sent(lead["id"], msg["Message-ID"], tname, str(msg["Subject"]), plain_of(msg), variant, subject_no)
     save_to_sent(msg, sent_at)
 
 

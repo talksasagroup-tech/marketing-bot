@@ -66,11 +66,19 @@ def test_a_template_that_would_break_sending_is_refused(admin, body, why):
     assert (admin["dir"] / "sacco.txt").read_text(encoding="utf-8") == before
 
 
-def test_first_email_needs_a_one_line_subject(admin):
-    for subject, why in (("", "can't be empty"), ("Two\nlines", "one line")):
+def test_first_email_needs_a_subject_and_at_most_three(admin):
+    for subject, why in (("", "can't be empty"), ("A\nB\nC\nD", "at most 3"), ("x" * 151, "under 150")):
         with pytest.raises(HTTPException) as e:
             save(admin, "first", "sacco", "Hello {company}", subject)
         assert why in e.value.detail
+
+
+def test_several_subjects_are_saved_one_per_line(admin, tmp_path):
+    save(admin, "first", "school", "Hi {company},\n\nText.", "Fee reminders by SMS\n\nSMS for {company}")
+    raw = (crm.TEMPLATE_DIR / "school.txt").read_bytes()
+    assert raw == b"Subject: Fee reminders by SMS\nSubject: SMS for {company}\nHi {company},\n\nText.\n"
+    t = crm.get_template("first", "school", admin)
+    assert t["subject"] == "Fee reminders by SMS\nSMS for {company}"
 
 
 def test_follow_up_1_keeps_the_line_swapped_for_old_wording(admin):

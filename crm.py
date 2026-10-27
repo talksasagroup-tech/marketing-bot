@@ -1357,23 +1357,28 @@ def report(days: int = 0, user=Depends(admin_only)):
                    MIN(s.sent_on) AS first_sent,
                    MAX(CASE WHEN r.label = 'bounce' THEN 1 ELSE 0 END) AS bounced_reply,
                    MAX(CASE WHEN r.id IS NOT NULL AND r.label NOT IN ('bounce','out_of_office') THEN 1 ELSE 0 END) AS replied,
-                   MAX(CASE WHEN r.label = 'interested' THEN 1 ELSE 0 END) AS interested_reply
+                   MAX(CASE WHEN r.label = 'interested' THEN 1 ELSE 0 END) AS interested_reply,
+                   (SELECT f.template FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1) AS template,
+                   (SELECT f.subject_no FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1) AS subject_no
             FROM leads l
             JOIN sent s ON s.lead_id = l.id
             LEFT JOIN replies r ON r.lead_id = l.id
+            WHERE {db.real('l')}
             GROUP BY l.id
             HAVING MIN(s.sent_on) >= ?""", (since,)).fetchall()
 
     def blank():
         return {"emailed": 0, "bounced": 0, "reachable": 0, "replied": 0, "interested": 0, "meetings": 0, "clients": 0}
 
-    groups = {"segment": {}, "score": {}, "source": {}}
+    groups = {"segment": {}, "score": {}, "source": {}, "template": {}}
     total = blank()
+    subject_names = {}
     for r in rows:
         bounced = r["status"] == "bounced" or bool(r["bounced_reply"])
         interested = bool(r["interested_reply"]) or r["status"] in ("meeting", "client")
         meeting = r["status"] in ("meeting", "client")
-        keys = {"segment": r["industry"], "score": _band(r["score"]), "source": r["source"]}
+        keys = {"segment": r["industry"], "score": _band(r["score"]), "source": r["source"],
+                "template": _subject_name(r["template"], r["subject_no"], subject_names)}
         for g, key in keys.items():
             for bucket in (groups[g].setdefault(key, blank()),) + ((total,) if g == "segment" else ()):
                 bucket["emailed"] += 1
@@ -1408,7 +1413,49 @@ def report(days: int = 0, user=Depends(admin_only)):
                                       GROUP BY 1 ORDER BY n DESC""")]
     return {"total": finish(total), "groups": out, "days": days, "min_sample": MIN_SAMPLE,
             "has_scores": bool(sc["score"]), "has_source": bool(sc["source"]),
-            "searches": _search_results(since), "lost_reasons": lost}
+            "searches": _search_results(since), "lost_reasons": lost, "answer_time": _answer_time(since)}
+
+
+def _subject_name(template, subject_no, cache):
+    """How the report names a first email: its template, and which subject it went out with
+    when that template tests more than one ("sacco · Loan reminders by SMS")."""
+    import sender
+    template = template or "(not recorded)"
+    if template not in cache:
+        path = sender.TEMPLATE_DIR / f"{template}.txt"
+        cache[template] = sender.split_template(path.read_text(encoding="utf-8"))[0] if path.is_file() else []
+    subjects = cache[template]
+    if not subject_no or (len(subjects) < 2 and subject_no == 1):
+        return template
+    subject = subjects[subject_no - 1] if subject_no <= len(subjects) else f"subject {subject_no}"
+    return f"{template} · {subject}"
+
+
+def _hours_between(start, end):
+    a, b = (datetime.strptime(t[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S") for t in (start, end))
+    return (b - a).total_seconds() / 3600
+
+
+def _answer_time(since):
+    """How quickly the team answers a client who is interested or asks a question: hours from
+    the reply arriving to our first CRM email after it. Replies answered some other way (by
+    phone, from webmail) don't show here, so `waiting` counts only replies still marked open."""
+    with conn() as c:
+        rows = c.execute(f"""
+            SELECT r.received_at, r.handled,
+                   (SELECT MIN(m.sent_at) FROM crm_messages m WHERE m.lead_id = r.lead_id
+                    AND m.status = 'sent' AND m.sent_at >= r.received_at) AS answered_at
+            FROM replies r JOIN leads l ON l.id = r.lead_id
+            WHERE r.label IN ('interested', 'question') AND r.received_at >= ? AND {db.real('l')}""",
+                         (since,)).fetchall()
+    hours = sorted(_hours_between(r["received_at"], r["answered_at"]) for r in rows if r["answered_at"])
+    median = None
+    if hours:
+        mid = len(hours) // 2
+        median = round(hours[mid] if len(hours) % 2 else (hours[mid - 1] + hours[mid]) / 2, 1)
+    return {"answered": len(hours), "median_hours": median,
+            "within_2h": sum(h <= 2 for h in hours),
+            "waiting": sum(1 for r in rows if not r["answered_at"] and not r["handled"])}
 
 
 def _search_key(query):
@@ -1680,7 +1727,7 @@ def edit_user(user_id: int, body: EditUserIn, admin=Depends(admin_only)):
 
 
 # ---------------------------------------------------------------- email templates (admin)
-# The bot reads templates/<industry>.txt (first email: a "Subject:" line, then the text),
+# The bot reads templates/<industry>.txt (first email: one or more "Subject:" lines, then the text),
 # templates/followup/ and templates/followup2/ (text only) every time it builds an email,
 # so a template saved here is used from the next email that goes out.
 
@@ -1691,6 +1738,8 @@ TEMPLATE_NAME = re.compile(r"^[a-z0-9_]+$")
 TEMPLATE_FIELDS = ("company", "uses", "opener", "attachment_line", "sender", "our_company", "phone", "website",
                    "profile_line", "profile_url", "industry")
 MAX_TEMPLATE_CHARS = 6000
+# A first email may have a few subjects to test against each other (sender.subject_for)
+MAX_SUBJECTS = 3
 
 
 def _fields(kind):
@@ -1707,17 +1756,24 @@ def _template_path(kind, name):
     return path
 
 
+def _subjects(subject):
+    """The subject box holds one subject per line."""
+    return [s.strip() for s in (subject or "").splitlines() if s.strip()]
+
+
 def _read_template(kind, path):
-    """(subject, body) the way sender.load_template reads them; subject is None for a follow-up."""
+    """(subject, body) the way sender reads them; subject is None for a follow-up, and one
+    subject per line when the first email tests several."""
+    import sender
     text = path.read_text(encoding="utf-8")
     if kind != "first":
         return None, text.strip()
-    subject, _, body = text.partition("\n")
-    return subject.replace("Subject:", "", 1).strip(), body.strip()
+    subjects, body = sender.split_template(text)
+    return "\n".join(subjects), body
 
 
 def _write_template(kind, path, subject, body):
-    text = (f"Subject: {subject}\n" if kind == "first" else "") + body.strip() + "\n"
+    text = ("".join(f"Subject: {s}\n" for s in _subjects(subject)) if kind == "first" else "") + body.strip() + "\n"
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:  # "\n" so the file doesn't change to CRLF on Windows
         f.write(text)
@@ -1734,7 +1790,7 @@ def _render(kind, name, subject, body):
     import sender
     lead = _sample_lead(name)
     if kind == "first":
-        msg = sender.compose(lead, sender.fill(subject, lead), body, sender.attachment())
+        msg = sender.compose(lead, sender.fill(_subjects(subject)[0], lead), body, sender.attachment())
     else:
         first = sender.fill(sender.load_template(lead["industry"])[1], lead)
         msg = sender.compose(lead, first if first.lower().startswith("re:") else "Re: " + first, body,
@@ -1747,12 +1803,13 @@ def _template_problem(kind, name, subject, body):
     """Why this template can't be saved (it would break or change sending in a way nobody meant), or None."""
     import sender
     if kind == "first":
-        if not subject:
+        subjects = _subjects(subject)
+        if not subjects:
             return "The subject can't be empty."
-        if "\n" in subject or "\r" in subject:
-            return "The subject must be one line."
-        if len(subject) > 150:
-            return "Keep the subject under 150 characters."
+        if len(subjects) > MAX_SUBJECTS:
+            return f"Test at most {MAX_SUBJECTS} subjects at a time, one per line."
+        if any(len(s) > 150 for s in subjects):
+            return "Keep each subject under 150 characters."
     if not body.strip():
         return "The email text can't be empty."
     if len(body) > MAX_TEMPLATE_CHARS:
