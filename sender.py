@@ -718,8 +718,8 @@ def _not_sent(error, lead):
             return "bounced"
         return _failed(lead, f"address refused for now: {code} {msg!r}", code)
     except (smtplib.SMTPSenderRefused, smtplib.SMTPAuthenticationError) as e:
+        # The fault is our mailbox, not this lead, so no failure is held against the lead
         print(f"The mail server refused our sender or login ({e}). Stopping.")
-        _failed(lead, str(e), getattr(e, "smtp_code", None))
         return "stop"
     except smtplib.SMTPResponseException as e:
         if e.smtp_code == 421:  # "service closing": the server is about to hang up

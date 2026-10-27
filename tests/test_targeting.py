@@ -63,6 +63,15 @@ def test_a_lead_already_on_that_domain_is_a_duplicate(world):
         <= next(d for d in result["duplicates"] if d["number"] == 1).items()
 
 
+def test_an_opted_out_organisation_is_not_imported(world):
+    with db.conn() as c:  # someone at Amaze asked us to stop, from another address
+        c.execute("INSERT INTO suppressed_domains (domain, reason) VALUES ('amazecreditlimited.com', 'unsubscribed')")
+    targeting.import_lenders("directory.pdf")
+    _, result, added = targeting.last_run()
+    assert "Amaze Credit Limited" not in [l["company"] for l in added]
+    assert "Amaze Credit Limited" in [s["name"] for s in result["suppressed"]]
+
+
 def test_company_names_match_without_legal_words():
     assert targeting.name_keys("Zenka Digital Ltd") == targeting.name_keys("Zenka Digital Limited")
     assert "tala" in targeting.name_keys("Inventure Mobile Limited (Trading as Tala)")

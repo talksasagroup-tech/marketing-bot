@@ -106,6 +106,7 @@ def test_sender_refused_stops_at_once(waiting, smtp):
     sender.run()
     assert smtp["delivered"] == []
     assert not failed_events("two@two.co.ke")
+    assert not failed_events("one@one.co.ke")  # our mailbox was refused, not this lead
 
 
 def test_broken_template_skips_only_that_lead(waiting, smtp, monkeypatch):

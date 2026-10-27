@@ -215,7 +215,6 @@ def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_UR
                 by_name.setdefault(key, lead["company"])
             for d in own_domains([lead["email"]], lead["website"]):
                 by_domain.setdefault(d, lead["company"])
-        blocked = {r[0] for r in c.execute("SELECT email FROM suppression")}
         for e in entries:
             row = {"number": e["number"], "name": e["name"], "email": e["email"], "phone": e["phone"]}
             if not e["email"]:
@@ -231,7 +230,7 @@ def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_UR
                        else f"{same_domain} is {by_domain[same_domain]}'s domain")
                 duplicates.append({**row, "reason": why})
                 continue
-            if e["email"] in blocked:
+            if db._blocked(c, e["email"]):  # opted out, itself or its whole organisation
                 suppressed.append(row)
                 continue
             lead_id = c.execute(
