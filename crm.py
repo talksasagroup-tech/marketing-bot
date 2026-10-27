@@ -190,6 +190,16 @@ def ensure_schema():
             user_id INTEGER REFERENCES users(id),
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        -- phone calls to leads that never answered an email, and how each went (CALL_OUTCOMES)
+        CREATE TABLE IF NOT EXISTS crm_calls (
+            id INTEGER PRIMARY KEY,
+            lead_id INTEGER NOT NULL REFERENCES leads(id),
+            user_id INTEGER REFERENCES users(id),
+            outcome TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_crm_calls_lead ON crm_calls(lead_id);
         -- one-time data changes, so each runs once and never undoes what people did since
         CREATE TABLE IF NOT EXISTS crm_migrations (
             name TEXT PRIMARY KEY,
@@ -500,9 +510,11 @@ SALES_FIELDS = ("id", "company", "email", "phone", "industry", "website", "score
 
 
 def _has_response(c, lead_id):
-    """Whether the organisation has written back: any reply but a bounce or an auto-reply."""
+    """Whether the organisation has answered us: any reply but a bounce or an auto-reply, or a
+    call where someone there was interested or asked us to call back."""
     return c.execute("SELECT 1 FROM replies WHERE lead_id = ? AND COALESCE(label, '') NOT IN ('bounce', 'out_of_office')"
-                     " LIMIT 1", (lead_id,)).fetchone() is not None
+                     " UNION ALL SELECT 1 FROM crm_calls WHERE lead_id = ? AND outcome IN ('interested', 'call_back')"
+                     " LIMIT 1", (lead_id, lead_id)).fetchone() is not None
 
 
 NOT_YET = "This organisation hasn't replied yet, so nobody can claim it. You can claim it once it writes back."
@@ -717,7 +729,7 @@ def claim(lead_id: int, user=Depends(current_user)):
         lead = _lead_or_404(c, lead_id, user)
         if lead["claimed_by"] == user["id"]:
             return {"ok": True}
-        if not lead["claimed_by"] and not _has_response(c, lead_id):
+        if not lead["claimed_by"] and not _has_response(c, lead_id) and not _on_call_list(c, lead_id):
             raise HTTPException(409, NOT_YET)
         # Only succeeds if nobody grabbed it in the meantime
         cur = c.execute("UPDATE leads SET claimed_by = ?, claimed_at = ? WHERE id = ? AND claimed_by IS NULL",
@@ -863,6 +875,117 @@ def set_next(lead_id: int, body: NextIn, user=Depends(current_user)):
         c.execute("UPDATE leads SET next_action = ?, next_action_due = ? WHERE id = ?", (action or None, due, lead_id))
         log_event(c, lead_id, user["id"], "next_step", f"{action} (due {due})" if action and due else action or "cleared")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- call list
+# Organisations the bot has finished emailing (the first email and both follow-ups, or just the
+# first while follow-ups are off) that never wrote back, and that have a phone number. Many
+# SACCOs, schools and churches answer the phone sooner than an info@ inbox. A call never opts
+# anyone out: email opt-outs come only from what they write (classifier.opt_out).
+
+CALL_AFTER_DAYS = 3  # days after the last email before the lead is on the call list
+CALL_OUTCOMES = {"no_answer": "No answer", "call_back": "Call back later", "interested": "Interested",
+                 "not_interested": "Not interested", "wrong_number": "Wrong number"}
+
+
+def _call_list_where():
+    """(SQL condition on leads l, its parameters) for leads on the call list."""
+    import sender
+    emails = 1 + sender.MAX_FOLLOWUPS if config.FOLLOWUPS_APPROVED else 1
+    last_by = (datetime.now(config.NAIROBI).date() - timedelta(days=CALL_AFTER_DAYS)).isoformat()
+    return (f"""COALESCE(l.phone, '') != '' AND l.status = 'sent' AND l.crm_emailed_at IS NULL
+        AND COALESCE(l.review_status, '') != 'rejected' AND {db.real('l')}
+        AND (SELECT COUNT(*) FROM sent s WHERE s.lead_id = l.id) >= ?
+        AND (SELECT MAX(s.sent_on) FROM sent s WHERE s.lead_id = l.id) <= ?
+        AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id
+                        AND COALESCE(r.label, '') NOT IN ('bounce', 'out_of_office'))""", (emails, last_by))
+
+
+def _on_call_list(c, lead_id):
+    where, params = _call_list_where()
+    lead = c.execute(f"SELECT l.email FROM leads l WHERE l.id = ? AND {where}", (lead_id, *params)).fetchone()
+    return bool(lead) and not db.blocked(lead["email"] or "")
+
+
+@router.get("/api/crm/calls")
+def call_list(user=Depends(current_user)):
+    """The leads to phone: nobody's yet, or yours. Never called first, then the longest since a call."""
+    where, params = _call_list_where()
+    if user["role"] != "admin":
+        where += " AND (l.claimed_by IS NULL OR l.claimed_by = %d)" % int(user["id"])
+    is_blocked = db.blocker()
+    with conn() as c:
+        names = _user_names(c)
+        rows = [dict(r) for r in c.execute(f"""
+            SELECT l.id, l.company, l.email, l.phone, l.industry, l.website, l.claimed_by,
+                   (SELECT MAX(s.sent_on) FROM sent s WHERE s.lead_id = l.id) AS last_emailed,
+                   (SELECT COUNT(*) FROM crm_calls k WHERE k.lead_id = l.id) AS calls,
+                   (SELECT k.id FROM crm_calls k WHERE k.lead_id = l.id ORDER BY k.id DESC LIMIT 1) AS last_call
+            FROM leads l WHERE {where}""", params)]
+        rows = [r for r in rows if not is_blocked(r["email"])]
+        for r in rows:
+            last = c.execute("SELECT outcome, note, created_at, user_id FROM crm_calls WHERE id = ?",
+                             (r.pop("last_call"),)).fetchone() if r["calls"] else None
+            r["last_outcome"] = last["outcome"] if last else None
+            r["last_note"] = last["note"] if last else None
+            r["last_called"] = iso(last["created_at"]) if last else None
+            r["last_caller"] = names.get(last["user_id"]) if last else None
+            r["owner"] = names.get(r["claimed_by"])
+            r["mine"] = r["claimed_by"] == user["id"]
+    rows.sort(key=lambda r: (r["calls"] > 0, r["last_called"] or "", r["company"] or ""))
+    return {"leads": rows, "outcomes": CALL_OUTCOMES, "after_days": CALL_AFTER_DAYS}
+
+
+class CallIn(BaseModel):
+    outcome: str
+    note: str = ""
+
+
+@router.post("/api/crm/leads/{lead_id}/calls")
+def log_call(lead_id: int, body: CallIn, user=Depends(current_user)):
+    """Record a call. Whoever logs it is handling the lead. Interested moves the lead to Replied
+    (it is then an open lead like one that wrote back), not interested closes it as lost, and a
+    wrong number takes the number off the lead (kept in the note)."""
+    if body.outcome not in CALL_OUTCOMES:
+        raise HTTPException(400, "Pick how the call went.")
+    note = " ".join(body.note.split())
+    if len(note) > 1000:
+        raise HTTPException(400, "Keep the call note under 1,000 characters.")
+    with conn() as c:
+        lead = _lead_or_404(c, lead_id, user)
+        _require_owner_or_free(lead, user)
+        if lead["status"] in ("unsubscribed", "bounced"):
+            raise HTTPException(409, "This lead unsubscribed or bounced. Don't call them about it.")
+        if lead["claimed_by"] != user["id"] and user["role"] != "admin" and not _on_call_list(c, lead_id):
+            raise HTTPException(409, "This lead isn't on the call list.")
+        if body.outcome == "wrong_number":
+            note = f"Wrong number: {lead['phone']}" + (f". {note}" if note else "")
+            c.execute("UPDATE leads SET phone = NULL WHERE id = ?", (lead_id,))
+        c.execute("INSERT INTO crm_calls (lead_id, user_id, outcome, note) VALUES (?,?,?,?)",
+                  (lead_id, user["id"], body.outcome, note or None))
+        if not lead["claimed_by"]:
+            c.execute("UPDATE leads SET claimed_by = ?, claimed_at = ? WHERE id = ? AND claimed_by IS NULL",
+                      (user["id"], now_utc(), lead_id))
+            log_event(c, lead_id, user["id"], "claimed", "by logging a call")
+        new = {"interested": "replied", "not_interested": "lost"}.get(body.outcome)
+        if new and lead["status"] != new:
+            c.execute("UPDATE leads SET status = ? WHERE id = ?", (new, lead_id))
+            db.log_event(c, lead_id, "status_changed", old=lead["status"], new=new, by="call")
+            if new == "lost":
+                c.execute("UPDATE leads SET lost_reason = 'not_interested' WHERE id = ?", (lead_id,))
+        log_event(c, lead_id, user["id"], "called", CALL_OUTCOMES[body.outcome] + (f": {note}" if note else ""))
+    return {"ok": True}
+
+
+def _call_results(since):
+    """How the calls went: made, reached someone, interested, not interested (since a date)."""
+    with conn() as c:
+        rows = c.execute(f"""SELECT k.outcome, COUNT(*) AS n FROM crm_calls k JOIN leads l ON l.id = k.lead_id
+                             WHERE k.created_at >= ? AND {db.real('l')} GROUP BY k.outcome""", (since,)).fetchall()
+    n = {r["outcome"]: r["n"] for r in rows}
+    return {"made": sum(n.values()), "reached": sum(v for k, v in n.items() if k not in ("no_answer", "wrong_number")),
+            "interested": n.get("interested", 0), "not_interested": n.get("not_interested", 0),
+            "wrong_number": n.get("wrong_number", 0)}
 
 
 # ---------------------------------------------------------------- correcting a reply's label
@@ -1359,7 +1482,9 @@ def report(days: int = 0, user=Depends(admin_only)):
                    MAX(CASE WHEN r.id IS NOT NULL AND r.label NOT IN ('bounce','out_of_office') THEN 1 ELSE 0 END) AS replied,
                    MAX(CASE WHEN r.label = 'interested' THEN 1 ELSE 0 END) AS interested_reply,
                    (SELECT f.template FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1) AS template,
-                   (SELECT f.subject_no FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1) AS subject_no
+                   (SELECT f.subject_no FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1) AS subject_no,
+                   MAX(CASE WHEN EXISTS (SELECT 1 FROM crm_calls k WHERE k.lead_id = l.id AND k.outcome = 'interested')
+                       THEN 1 ELSE 0 END) AS call_interested
             FROM leads l
             JOIN sent s ON s.lead_id = l.id
             LEFT JOIN replies r ON r.lead_id = l.id
@@ -1375,7 +1500,8 @@ def report(days: int = 0, user=Depends(admin_only)):
     subject_names = {}
     for r in rows:
         bounced = r["status"] == "bounced" or bool(r["bounced_reply"])
-        interested = bool(r["interested_reply"]) or r["status"] in ("meeting", "client")
+        # interested by email, or on the phone after the emails got no answer
+        interested = bool(r["interested_reply"] or r["call_interested"]) or r["status"] in ("meeting", "client")
         meeting = r["status"] in ("meeting", "client")
         keys = {"segment": r["industry"], "score": _band(r["score"]), "source": r["source"],
                 "template": _subject_name(r["template"], r["subject_no"], subject_names)}
@@ -1413,7 +1539,8 @@ def report(days: int = 0, user=Depends(admin_only)):
                                       GROUP BY 1 ORDER BY n DESC""")]
     return {"total": finish(total), "groups": out, "days": days, "min_sample": MIN_SAMPLE,
             "has_scores": bool(sc["score"]), "has_source": bool(sc["source"]),
-            "searches": _search_results(since), "lost_reasons": lost, "answer_time": _answer_time(since)}
+            "searches": _search_results(since), "lost_reasons": lost, "answer_time": _answer_time(since),
+            "calls": _call_results(since)}
 
 
 def _subject_name(template, subject_no, cache):

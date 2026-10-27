@@ -436,6 +436,7 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
   <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
   <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></symbol>
   <symbol id="i-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
@@ -464,6 +465,7 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
       <button class="navlink" data-go="mine"><svg class="i"><use href="#i-user"/></svg>My leads<span class="badge soft" id="nb-mine" hidden></span></button>
       <button class="navlink" data-go="closed"><svg class="i"><use href="#i-archive"/></svg>Won and lost</button>
       <button class="navlink" data-go="orgs"><svg class="i"><use href="#i-building"/></svg>Organisations</button>
+      <button class="navlink" data-go="calls"><svg class="i"><use href="#i-phone"/></svg>Calls<span class="badge" id="nb-calls" hidden></span></button>
       <button class="navlink" data-go="review" id="nav-review" hidden><svg class="i"><use href="#i-check"/></svg>To review<span class="badge" id="nb-review" hidden></span></button>
     </nav>
   </div>
@@ -611,6 +613,14 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
       </div>
     </div>
 
+    <div class="view" id="v-calls" hidden>
+      <div class="page" style="max-width:1100px">
+        <div><h1>Calls</h1>
+          <p class="lead" id="calls-lead">Organisations that got all our emails and never wrote back, with a phone number to try. Log how each call went: "Interested" moves the lead to your open leads, "Not interested" closes it. A call never stops their emails or opts them out.</p></div>
+        <div id="calls-body"><p class="muted">Loading…</p></div>
+      </div>
+    </div>
+
     <div class="view" id="v-review" hidden>
       <div class="page" style="max-width:1100px">
         <div><h1>To review</h1>
@@ -702,7 +712,7 @@ $("theme").onclick = () => {
 
 /* ---------------- navigation ---------------- */
 const TITLES = { open: "Open leads", mine: "My leads", closed: "Won and lost", orgs: "Organisations", report: "What's working",
-                 team: "Team", templates: "Email templates", account: "My account", review: "To review" };
+                 team: "Team", templates: "Email templates", account: "My account", review: "To review", calls: "Calls" };
 function go(view, opts = {}) {
   if (["team", "report", "templates", "review"].includes(view) && state.me?.role !== "admin") view = "open";
   if (state.view === "templates" && view !== "templates" && tplDirty() && !confirm("Your template changes aren't saved. Leave them?")) return;
@@ -710,7 +720,7 @@ function go(view, opts = {}) {
   if (opts.filter) state.filter = opts.filter;  // a summary card picks the list it shows
   $("v-leads").hidden = !LIST_VIEWS.includes(view);
   $("v-team").hidden = view !== "team"; $("v-account").hidden = view !== "account"; $("v-report").hidden = view !== "report";
-  $("v-templates").hidden = view !== "templates"; $("v-review").hidden = view !== "review";
+  $("v-templates").hidden = view !== "templates"; $("v-review").hidden = view !== "review"; $("v-calls").hidden = view !== "calls";
   document.querySelectorAll("[data-go]").forEach(b => b.dataset.go === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
   $("crumb").textContent = TITLES[view];
   $("subtabs").hidden = view !== "open";
@@ -722,6 +732,7 @@ function go(view, opts = {}) {
   if (view === "report") loadReport();
   if (view === "templates") loadTemplates();
   if (view === "review") loadReview();
+  if (view === "calls") loadCalls();
   if (view === "account") $("acct-lead").textContent = `${state.me.name} · ${state.me.email} · ${state.me.role === "admin" ? "Admin" : "Sales"}`;
   if (!$("v-leads").hidden) { if (!opts.keepSel) { state.sel = null; state.detail = null; } loadLeads(); }
 }
@@ -1420,6 +1431,16 @@ function answerPanel(a) {
       <div class="kpi"><span>Still waiting for an answer</span><b>${a.waiting}</b></div>
     </div></div>`;
 }
+function callsPanel(k) {
+  if (!k || !k.made) return "";
+  return `<div class="panel"><h3>Phone calls</h3><p class="lead2">Calls to organisations that never answered our emails, in this period. Interested ones count in the tables above too.</p>
+    <div class="rep-sum" style="padding:0 16px 16px">
+      <div class="kpi"><span>Calls made</span><b>${k.made}</b></div>
+      <div class="kpi"><span>Reached someone</span><b>${k.reached}</b></div>
+      <div class="kpi"><span>Interested</span><b>${k.interested}</b></div>
+      <div class="kpi"><span>Not interested</span><b>${k.not_interested}</b></div>
+    </div></div>`;
+}
 function lostTable(items) {
   if (!items || !items.length) return "";
   const total = items.reduce((n, i) => n + i.n, 0);
@@ -1459,6 +1480,7 @@ async function loadReport() {
         ${repTable("By template and subject", "Each first email by the template it came from. A template with two or three subject lines shows each subject on its own row, so you can keep the one that brings more replies.", d.groups.template)}
         ${d.has_scores ? repTable("By need score", "If the scoring works, higher bands should reply more. If they don't, the rules need changing.", d.groups.score) : `<div class="panel"><h3>By need score</h3><p class="lead2" style="padding-bottom:14px">No scores yet. They appear once the targeting step has scored your leads.</p></div>`}
         ${d.has_source ? repTable("By where the lead came from", "", d.groups.source) : ""}
+        ${callsPanel(d.calls)}
         ${lostTable(d.lost_reasons)}
         ${searchTable(d.searches)}
       </div>`;
@@ -1526,6 +1548,46 @@ $("rev-body").addEventListener("click", async (e) => {
     }
   } catch (err) {}
   renderReview();
+});
+
+/* ---------------- calls ---------------- */
+const calls = { leads: [], outcomes: {} };
+async function loadCalls(quiet) {
+  try {
+    const d = await api("/api/crm/calls");
+    calls.leads = d.leads; calls.outcomes = d.outcomes;
+    const n = d.leads.filter(l => !l.claimed_by || l.mine).length;
+    $("nb-calls").textContent = n || ""; $("nb-calls").hidden = !n;
+    if (!quiet) renderCalls();
+  } catch (e) { if (!quiet) $("calls-body").innerHTML = `<div class="empty"><b>Couldn't load the call list</b>${esc(e.message)}</div>`; }
+}
+function renderCalls() {
+  if (!calls.leads.length) { $("calls-body").innerHTML = `<div class="empty"><b>Nobody to call</b>Organisations show up here a few days after their last email, if they never wrote back and have a phone number.</div>`; return; }
+  const opts = Object.entries(calls.outcomes).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
+  $("calls-body").innerHTML = `<div class="panel"><div class="tablewrap"><table>
+    <thead><tr><th>Organisation</th><th>Phone</th><th>Last call</th><th>How did it go?</th></tr></thead>
+    <tbody>${calls.leads.map(l => `<tr data-id="${l.id}">
+      <td><div class="truncate"><b style="font-weight:500">${esc(l.company)}</b>
+        <div class="muted" style="font-size:12.5px">${esc(industryName(l.industry))}${l.website ? ` · <a href="https://${esc(l.website)}" target="_blank" rel="noopener noreferrer">${esc(l.website)}</a>` : ""} · last emailed ${esc(l.last_emailed || "")}</div>
+        ${l.owner ? `<div class="muted" style="font-size:12.5px">${l.mine ? "Yours" : esc(l.owner) + "'s"}</div>` : ""}</div></td>
+      <td><a href="tel:${esc(l.phone)}" style="white-space:nowrap">${esc(l.phone)}</a></td>
+      <td class="muted" style="font-size:12.5px;white-space:normal;max-width:240px">${l.calls ? `${esc(calls.outcomes[l.last_outcome] || l.last_outcome)} · ${esc(when(l.last_called))}${l.last_caller ? " · " + esc(l.last_caller) : ""}${l.last_note ? `<br>${esc(l.last_note)}` : ""}${l.calls > 1 ? `<br>${l.calls} calls` : ""}` : "Not called yet"}</td>
+      <td><div class="acts" style="flex-wrap:wrap;gap:6px">
+        <select class="select" data-c="outcome" aria-label="How the call went" style="width:auto;height:30px">${opts}</select>
+        <input class="input" data-c="note" placeholder="Note (optional)" maxlength="1000" style="height:30px;width:180px">
+        <button class="btn primary sm" data-c="log">Log call</button></div></td>
+    </tr>`).join("")}</tbody></table></div></div>`;
+}
+$("calls-body").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-c=log]"); if (!b) return;
+  const tr = b.closest("tr"), id = +tr.dataset.id, lead = calls.leads.find(l => l.id === id);
+  const outcome = tr.querySelector("[data-c=outcome]").value, note = tr.querySelector("[data-c=note]").value;
+  b.disabled = true;
+  try {
+    await act(() => api(`/api/crm/leads/${id}/calls`, { method: "POST", body: { outcome, note } }),
+      outcome === "interested" ? `${lead.company} is in your open leads now.` : `Call to ${lead.company} logged.`);
+    await loadCalls(); refreshCounts();
+  } catch (err) { b.disabled = false; }
 });
 
 /* ---------------- team ---------------- */
@@ -1635,6 +1697,7 @@ async function refreshAll(manual) {
   const t = $("c-text"), picked = (state.files[state.sel + ":" + state.mode] || []).length;
   if (!manual && ((t && t.value.trim()) || $("c-subj")?.value.trim() || picked)) { refreshCounts(); return; } // don't disturb someone writing
   loadHealth();
+  loadCalls(true);  // the badge only: redrawing the list would lose a note being typed
   if (!$("v-leads").hidden) await loadLeads(); else { refreshCounts(); if (state.view === "team") loadTeam(); if (state.view === "report") loadReport(); if (state.view === "review") loadReview(); }
 }
 function greet() {  // sales only: admins have it on the dashboard
@@ -1654,6 +1717,7 @@ async function start() {
   $("drybar").hidden = !me.dry_run;
   greet();
   loadHealth();
+  loadCalls(true);
   await loadUsers();
   const [v, sel] = location.hash.slice(1).split("/");
   if (v === "templates" && sel) tpl.name = sel;  // #templates/sacco opens that industry's template
