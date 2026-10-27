@@ -1,4 +1,4 @@
-"""Finds contact emails on company websites.
+"""Finds contact emails, and phone numbers, on company websites.
 
 Input: a CSV of companies you already have (name, website, industry).
 Get these from public directories: Kenya Yellow Pages, SASRA's licensed SACCO list,
@@ -26,6 +26,28 @@ BAD_ENDINGS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")
 BAD_WORDS = ("example.com", "sentry", "wixpress", "domain.com", "yourname", "email.com")
 # Prefer generic business inboxes (safer under the Data Protection Act)
 PREFERRED = ("info@", "sales@", "admin@", "hello@", "contact@", "enquiries@", "office@")
+# Something that looks like a Kenyan phone number: +254 or 254 or 0, then digits with the
+# usual spaces, dashes, dots or brackets. phone_number() decides whether it really is one.
+PHONE_RE = re.compile(r"(?<![\d+])(?:\+\s*254|254|0)[\d\s().-]{8,14}\d(?!\d)")
+
+
+def phone_number(text):
+    """A Kenyan number written any common way ("0712 345 678", "+254 (0) 20 123 4567") as
+    +254 and nine digits, or None if it isn't one. Mobiles start 7 or 1 after the 254,
+    landlines 2 to 6 (020 is Nairobi)."""
+    digits = re.sub(r"\D", "", text)
+    if digits.startswith("254"):
+        digits = digits[3:]
+    digits = digits.removeprefix("0")  # 0712..., and the (0) in +254 (0) 20...
+    if len(digits) != 9 or digits[0] not in "1234567":
+        return None
+    return "+254" + digits
+
+
+def pick_phone(phones):
+    """The number to call: a mobile if there is one (people answer those), else the first found.
+    `phones` is in the order they were found."""
+    return next((p for p in phones if p[4] in "71"), phones[0] if phones else None)
 
 
 def clean(emails, site_domain):
@@ -59,11 +81,23 @@ def fetch(url):
     return BeautifulSoup(r.text, "html.parser") if r.status_code == 200 else None
 
 
-def scrape_site(url):
+def phones_on(soup):
+    """The Kenyan phone numbers on a page, tel: links first, in the order they appear."""
+    found = [a["href"][4:] for a in soup.select('a[href^="tel:"]')] + PHONE_RE.findall(soup.get_text(" "))
+    out = []
+    for raw in found:
+        number = phone_number(raw)
+        if number and number not in out:
+            out.append(number)
+    return out
+
+
+def scrape_contacts(url):
+    """(emails, phones) from a site's homepage and contact/about pages."""
     if not url.startswith("http"):
         url = "https://" + url
     domain = urlparse(url).netloc.replace("www.", "")
-    found = set()
+    found, phones = set(), []
     for path in CONTACT_PATHS:
         soup = fetch(urljoin(url, path))
         if soup is None:
@@ -72,10 +106,15 @@ def scrape_site(url):
         for a in soup.select('a[href^="mailto:"]'):
             found.add(a["href"][7:].split("?")[0])
         found.update(EMAIL_RE.findall(soup.get_text(" ")))
+        phones += [p for p in phones_on(soup) if p not in phones]
         time.sleep(1)  # be polite
         if found and path:
             break
-    return clean(found, domain)
+    return clean(found, domain), phones
+
+
+def scrape_site(url):
+    return scrape_contacts(url)[0]
 
 
 _pages = {}  # site -> page texts, so one run doesn't fetch the same site twice
@@ -139,17 +178,19 @@ def run(csv_path):
         rows = list(csv.DictReader(f))
     for i, row in enumerate(rows, 1):
         name, site, industry = row["company"], row["website"], row.get("industry", "")
+        phone = phone_number(row.get("phone") or "")
         # If the CSV already has an email, use it directly
         if row.get("email"):
-            if db.add_lead(name, site, industry, row["email"], "csv"):
+            if db.add_lead(name, site, industry, row["email"], "csv", phone=phone):
                 added += 1
             continue
-        emails = scrape_site(site)
+        emails, phones = scrape_contacts(site)
         best = pick_best(emails)
         if best and db.blocked(best):
             print(f"[{i}/{len(rows)}] {name}: {best} is on the suppression list")
             continue
         print(f"[{i}/{len(rows)}] {name}: {best or 'no email found'}")
-        if best and db.add_lead(name, site, industry, best, "csv", source_url=site):
+        if best and db.add_lead(name, site, industry, best, "csv", source_url=site,
+                                phone=phone or pick_phone(phones)):
             added += 1
     print(f"Added {added} new leads.")

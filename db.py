@@ -424,18 +424,19 @@ def unsubscribe(email):
 NOT_REVIEWED = ("pending", "rejected")
 
 def add_lead(company, website, industry, email, source=None, source_query=None, source_url=None,
-             review_status=None):
+             review_status=None, phone=None):
     """Returns True if the lead is new. An address on the suppression list is never added.
-    review_status 'pending' holds the lead until a person checks it in the CRM."""
+    review_status 'pending' holds the lead until a person checks it in the CRM. phone is the
+    number the sales team can call (scraper.phone_number's +254 form)."""
     email = email.lower().strip()
     with conn() as c:
         if _blocked(c, email):
             return False
         added = c.execute(
             "INSERT INTO leads (company, website, industry, email, source, source_query,"
-            " source_url, review_status, discovered_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
+            " source_url, review_status, phone, discovered_at) VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
             " ON CONFLICT DO NOTHING RETURNING id",
-            (company, website, industry, email, source, source_query, source_url, review_status),
+            (company, website, industry, email, source, source_query, source_url, review_status, phone),
         ).fetchone()
         if not added:
             return False

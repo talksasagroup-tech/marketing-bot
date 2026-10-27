@@ -43,7 +43,7 @@ def test_discovered_leads_are_held_for_review(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
     db.init()
     monkeypatch.setattr(discover, "look_at", lambda url: ("Grand Hotel | Home", True))
-    monkeypatch.setattr(discover.scraper, "scrape_site", lambda home: ["info@grandhotel.co.ke"])
+    monkeypatch.setattr(discover.scraper, "scrape_contacts", lambda home: (["info@grandhotel.co.ke"], []))
     monkeypatch.setattr(discover, "save_csv", lambda row: None)
     assert discover.consider("https://grandhotel.co.ke", "church", "church Nairobi", set())
     assert db.find_lead_by_email("info@grandhotel.co.ke")["review_status"] == "pending"

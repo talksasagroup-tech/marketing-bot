@@ -294,7 +294,7 @@ RIVAL_TITLE = re.compile(r"bulk sms", re.I)
 RESULTS_PER_QUERY = 10
 DEFAULT_MAX = 30
 CSV_PATH = Path(__file__).parent / "discovered.csv"
-CSV_COLUMNS = ["company", "website", "industry", "email", "query"]
+CSV_COLUMNS = ["company", "website", "industry", "email", "phone", "query"]
 
 
 def domain_of(url):
@@ -357,6 +357,14 @@ def search(query):
 
 def save_csv(row):
     is_new = not CSV_PATH.exists()
+    if not is_new:
+        with open(CSV_PATH, newline="", encoding="utf-8-sig") as f:
+            old = list(csv.DictReader(f))
+        if old and "phone" not in old[0]:  # a file from before phones were kept: rewrite it with the column
+            with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, restval="")
+                w.writeheader()
+                w.writerows(old)
     with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         if is_new:
@@ -382,7 +390,8 @@ def consider(url, category, query, seen):
     if reason:
         print(f"    {domain}: skipped ({reason})")
         return None
-    email = scraper.pick_best(scraper.scrape_site(home))
+    emails, phones = scraper.scrape_contacts(home)
+    email = scraper.pick_best(emails)
     if not email:
         print(f"    {domain}: no email found")
         return None
@@ -391,11 +400,13 @@ def consider(url, category, query, seen):
         return None
     name = company_name(title, domain)
     # held for a person to confirm its industry: the search that found it is only a guess
-    if not db.add_lead(name, domain, category, email, "search", query, url, review_status="pending"):
+    phone = scraper.pick_phone(phones)
+    if not db.add_lead(name, domain, category, email, "search", query, url, review_status="pending",
+                       phone=phone):
         print(f"    {domain}: {email} already a lead")
         return None
     row = {"company": name, "website": domain, "industry": category,
-           "email": email, "query": query}
+           "email": email, "phone": phone or "", "query": query}
     save_csv(row)
     print(f"    + {name}  <{email}>")
     return row
