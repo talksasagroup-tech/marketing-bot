@@ -63,6 +63,9 @@ IMAP_PASS = env("IMAP_PASS", SMTP_PASS)
 # its account in front.
 FIRST_IMAP_USER = env("FIRST_IMAP_USER", IMAP_USER)
 POLL_MINUTES = int(env("POLL_MINUTES", "5"))
+# An interested reply or a question nobody has answered from the CRM after this many hours
+# gets a second Telegram alert (weekdays 8:00-19:00 Nairobi time), and shows as late in the CRM
+STALE_REPLY_HOURS = float(env("STALE_REPLY_HOURS", "2"))
 
 # AI classifier: "ollama" (local, free, open source) or "groq" (free tier API)
 AI_PROVIDER = env("AI_PROVIDER", "ollama")

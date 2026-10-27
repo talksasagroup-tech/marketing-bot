@@ -996,7 +996,7 @@ function renderList() {
     <button class="row" data-id="${l.id}" ${l.id === state.sel ? 'aria-current="true"' : ""}>
       <span class="l1">${l.waiting ? '<span class="dot" title="Waiting for an answer"></span>' : ""}<b class="truncate">${esc(l.company || l.email)}</b>
         <span class="when">${esc(when(l.last_received))}</span></span>
-      <span class="l3">${scoreHTML(l.score)}${chip(STAGES, l.status)}${l.can_email ? "" : '<span class="chip neg plain">Can\'t be emailed</span>'}${dueHTML(l)}
+      <span class="l3">${scoreHTML(l.score)}${chip(STAGES, l.status)}${l.can_email ? "" : '<span class="chip neg plain">Can\'t be emailed</span>'}${l.late ? '<span class="chip neg plain" title="Interested or asking, and still waiting for our answer">Answer now</span>' : ""}${dueHTML(l)}
         <span class="truncate" style="margin-left:auto">${l.owner ? (l.mine ? "You" : esc(l.owner)) : "Unclaimed"}</span></span>
     </button>`).join("");
 }

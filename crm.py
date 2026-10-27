@@ -580,6 +580,7 @@ def open_leads(scope: str = "open", user=Depends(current_user)):
     elif user["role"] != "admin":
         where += " AND (l.claimed_by IS NULL OR l.claimed_by = %d)" % me
     is_blocked = db.blocker()
+    late_before = (datetime.now(timezone.utc) - timedelta(hours=config.STALE_REPLY_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     with conn() as c:
         names = _user_names(c)
         sc = _score_cols(c)
@@ -601,12 +602,17 @@ def open_leads(scope: str = "open", user=Depends(current_user)):
             r["last_label"] = last["label"] if last else None
             r["last_summary"] = (screen_text(last["summary"]) or (last["body"] or "")[:160]) if last else ""
             r["last_received"] = iso(last["received_at"]) if last else None
+            answered = r["last_answer"]  # UTC text, compared before it is turned into ISO for the browser
             r["last_answer"] = iso(r["last_answer"])
             r["claimed_at"] = iso(r["claimed_at"])
             r["owner"] = names.get(r["claimed_by"])
             r["mine"] = r["claimed_by"] == user["id"]
             r["can_email"] = bool(r["can_email"]) and not is_blocked(r["email"])
             r["due"] = _due(r)
+            # someone interested or with a question has waited longer than STALE_REPLY_HOURS
+            r["late"] = bool(r["waiting"] and last and last["label"] in ("interested", "question")
+                             and not (answered and answered >= last["received_at"])
+                             and last["received_at"] <= late_before)
             del r["last_reply_id"]
         mine = c.execute(f"SELECT COUNT(*) FROM leads l WHERE {MINE} AND l.claimed_by = ?", (me,)).fetchone()[0]
         review = c.execute(f"SELECT COUNT(*) FROM leads WHERE review_status = 'pending' AND status IN"

@@ -5,7 +5,7 @@ import imaplib
 import json
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.errors import HeaderParseError
 from email.header import decode_header, make_header
 from email.utils import parseaddr
@@ -289,8 +289,55 @@ def check_once(catch_up=False):
     box.logout()
     # Heartbeat for the dashboard: when the inbox was last checked
     (Path(__file__).parent / "last_check.txt").write_text(datetime.now().isoformat(timespec="seconds"))
+    remind_late()
     send_alerts()
     return handled
+
+
+# Replies that someone is waiting on us to answer
+WAITING_LABELS = ("interested", "question")
+
+
+def late_replies(now=None):
+    """Interested replies and questions nobody has answered from the CRM or marked done
+    within STALE_REPLY_HOURS, that haven't had their second alert yet. Empty when the CRM
+    isn't set up (it adds the column that says a reply was handled)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=config.STALE_REPLY_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    with db.conn() as c:
+        if "handled" not in db.columns(c, "replies") or not db.columns(c, "crm_messages"):
+            return []
+        return c.execute(f"""
+            SELECT r.id, r.from_email, r.subject, r.summary, r.label, r.received_at, l.company
+            FROM replies r JOIN leads l ON l.id = r.lead_id
+            WHERE r.label IN ({','.join('?' * len(WAITING_LABELS))}) AND COALESCE(r.handled, 0) = 0
+              AND r.realerted_at IS NULL AND r.received_at <= ?
+              AND NOT EXISTS (SELECT 1 FROM crm_messages m WHERE m.lead_id = r.lead_id
+                              AND m.status != 'failed' AND m.sent_at >= r.received_at)
+            ORDER BY r.id""", (*WAITING_LABELS, cutoff)).fetchall()
+
+
+def working_hours(now=None):
+    """Weekdays 8:00 to 19:00 in Nairobi: when a second alert is worth waking someone for."""
+    local = (now or datetime.now(timezone.utc)).astimezone(config.NAIROBI)
+    return local.weekday() < 5 and 8 <= local.hour < 19
+
+
+def remind_late(now=None):
+    """Queue one more Telegram alert for each late reply (late_replies), in working hours
+    only, so a client who is interested doesn't wait for an answer. Returns how many."""
+    if not working_hours(now):
+        return 0
+    late = late_replies(now)
+    for r in late:
+        hours = config.STALE_REPLY_HOURS
+        db.queue_alert(None, f"⏰ STILL NOT ANSWERED — {r['company'] or r['from_email']}\n"
+                             f"{r['label'].replace('_', ' ').capitalize()} reply from {r['from_email']}, "
+                             f"no answer after {hours:g} hour{'s' if hours != 1 else ''}.\n"
+                             f"Subject: {r['subject']}\n\nSummary: {r['summary'] or ''}")
+        with db.conn() as c:
+            c.execute("UPDATE replies SET realerted_at = CURRENT_TIMESTAMP WHERE id = ?", (r["id"],))
+    return len(late)
 
 
 # Errors about the mail server connection or the database, not about one email. They stop the

@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS replies (
     imap_uid TEXT UNIQUE,
     -- the email's own Message-ID, so a copy found in another folder isn't stored twice
     message_id TEXT,
-    received_at TEXT DEFAULT CURRENT_TIMESTAMP
+    received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- when the second alert went out for an interested reply nobody had answered (inbox.remind_late)
+    realerted_at TEXT
 );
 -- mail that isn't from a lead, so the inbox check doesn't look at it again
 CREATE TABLE IF NOT EXISTS skipped (
@@ -329,7 +331,7 @@ def init():
         # Databases made before these columns existed: add them, leave the rows alone
         for table, col, kind in (("sent", "sent_subject", "TEXT"), ("sent", "sent_body", "TEXT"),
                                  ("sent", "sent_at", "TEXT"), ("sent", "variant", "TEXT"),
-                                 ("sent", "subject_no", "INTEGER"),
+                                 ("sent", "subject_no", "INTEGER"), ("replies", "realerted_at", "TEXT"),
                                  ("leads", "opener", "TEXT"), ("leads", "use_case", "TEXT"), ("leads", "subject_topic", "TEXT"),
                                  ("leads", "uses", "TEXT"),
                                  ("leads", "confidence", "REAL"), ("leads", "est_year", "INTEGER"),
