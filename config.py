@@ -95,3 +95,8 @@ PROFILE_URL = env("PROFILE_URL", "")  # optional, e.g. a company profile PDF or 
 SEARCH_PROVIDER = env("SEARCH_PROVIDER", "duckduckgo").strip().lower()
 TAVILY_API_KEY = env("TAVILY_API_KEY", "")
 TAVILY_MONTHLY_CAP = int(env("TAVILY_MONTHLY_CAP", "900"))
+# Google Places (websearch.places): businesses on Google Maps with their website and phone.
+# Off unless the key is set. Google bills each call beyond its free monthly allowance, so
+# PLACES_MONTHLY_CAP stops the calls for the rest of the month.
+GOOGLE_PLACES_API_KEY = env("GOOGLE_PLACES_API_KEY", "")
+PLACES_MONTHLY_CAP = int(env("PLACES_MONTHLY_CAP", "500"))

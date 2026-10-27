@@ -292,6 +292,10 @@ ISP_TITLE = re.compile(r"internet service provider|\bISP\b|fibre internet|fiber 
 # Other bulk SMS companies are competitors, not leads
 RIVAL_TITLE = re.compile(r"bulk sms", re.I)
 RESULTS_PER_QUERY = 10
+# How a category is asked for on Google Maps, where it isn't its own name
+PLACES_TERMS = {"school": "private school", "church": "church", "tech_startup": "technology company",
+                "hr_payroll": "payroll services company", "saas": "software company",
+                "digital_lender": "loan company", "fintech": "fintech company"}
 DEFAULT_MAX = 30
 CSV_PATH = Path(__file__).parent / "discovered.csv"
 CSV_COLUMNS = ["company", "website", "industry", "email", "phone", "query"]
@@ -393,11 +397,13 @@ def save_csv(row):
         w.writerow(row)
 
 
-def consider(url, category, query, seen, name=None):
+def consider(url, category, query, seen, name=None, company=None, phone=None):
     """Visit one company site and add it as a lead if it qualifies.
     `name` is the organisation being looked for (a name from a register): the site is skipped
     unless its title or domain shares a distinctive word with that name, and the lead gets
-    that name rather than the page title. Returns the new lead's row, or None."""
+    that name rather than the page title. `company` and `phone` are what a business listing
+    (Google Places) says, used instead of the page title and the numbers on the site.
+    Returns the new lead's row, or None."""
     domain = domain_of(url)
     if domain in seen or skip_domain(domain):
         return None
@@ -421,9 +427,9 @@ def consider(url, category, query, seen, name=None):
     if db.blocked(email):
         print(f"    {domain}: {email} is on the suppression list")
         return None
-    name = name or company_name(title, domain)
+    name = name or company or company_name(title, domain)
     # held for a person to confirm its industry: the search that found it is only a guess
-    phone = scraper.pick_phone(phones)
+    phone = scraper.phone_number(phone or "") or scraper.pick_phone(phones)
     if not db.add_lead(name, domain, category, email, "search", query, url, review_status="pending",
                        phone=phone):
         print(f"    {domain}: {email} already a lead")
@@ -498,9 +504,36 @@ def discover_from_lists(category, limit, seen):
     return added
 
 
+def places_query(category, town):
+    """What to ask Google Maps for: "sacco in Nakuru, Kenya"."""
+    return f"{PLACES_TERMS.get(category, category.replace('_', ' '))} in {town}, Kenya"
+
+
+def discover_from_places(category, limit, seen):
+    """Businesses Google Maps lists for this category in a random town (only when
+    GOOGLE_PLACES_API_KEY is set). Returns the leads added."""
+    if websearch.why_not_places():
+        return []
+    added = []
+    query = places_query(category, random.choice(TOWNS))
+    print(f"  places: {query}")
+    for res in websearch.places(query):
+        row = consider(res["href"], category, f"places: {query}", seen, company=res["title"] or None,
+                       phone=res["phone"])
+        if row:
+            added.append(row)
+            if len(added) >= limit:
+                break
+    return added
+
+
 def discover_category(category, limit, seen):
-    """Returns the leads added for this category (at most `limit`)."""
-    added = discover_from_lists(category, limit, seen)
+    """Returns the leads added for this category (at most `limit`): Google Places first when
+    it is set up, then list pages, then web searches."""
+    added = discover_from_places(category, limit, seen)
+    if len(added) >= limit:
+        return added
+    added += discover_from_lists(category, limit - len(added), seen)
     if len(added) >= limit:
         return added
     for template in QUERIES[category]:

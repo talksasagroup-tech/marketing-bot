@@ -8,8 +8,14 @@
 Every call is counted in search_usage by month and provider. A Tavily call counts even
 when it fails, so the cap is never passed. Results come back as DuckDuckGo gives them:
 [{"title", "href", "body"}].
+
+  GOOGLE_PLACES_API_KEY      Google Places (New) key: places() finds businesses on Google
+                             Maps with their website and phone. Off without it
+  PLACES_MONTHLY_CAP         Places calls allowed per calendar month (UTC)
 """
 from datetime import datetime, timezone
+
+import requests
 
 import config
 import db
@@ -86,3 +92,43 @@ def search(query, max_results=10):
     except Exception as e:
         print(f"    search failed: {e}")
         return []
+
+
+PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
+# Only the fields discover needs. Website and phone put the call in Google's "Pro" price band.
+PLACES_FIELDS = "places.displayName,places.websiteUri,places.nationalPhoneNumber,places.internationalPhoneNumber"
+
+
+def why_not_places():
+    """Why Google Places won't be asked, or None if it will."""
+    if not config.GOOGLE_PLACES_API_KEY:
+        return "no GOOGLE_PLACES_API_KEY"
+    if calls("places") >= config.PLACES_MONTHLY_CAP:
+        return f"this month's cap of {config.PLACES_MONTHLY_CAP} Places calls is reached"
+    return None
+
+
+def places(query, max_results=20):
+    """[{"title", "href", "body", "phone"}] for businesses in Kenya matching the query
+    ("sacco in Nakuru"), the ones with a website only, or [] when Places is off or fails.
+    title is the business's name on Google Maps and phone the number listed there."""
+    reason = why_not_places()
+    if reason:
+        print(f"    (Google Places not asked: {reason})")
+        return []
+    count("places")  # counted before the call, so a failed call still counts toward the cap
+    try:
+        r = requests.post(PLACES_URL, timeout=20, json={
+            "textQuery": query, "regionCode": "KE", "pageSize": min(20, max_results)},
+            headers={"X-Goog-Api-Key": config.GOOGLE_PLACES_API_KEY, "X-Goog-FieldMask": PLACES_FIELDS})
+        r.raise_for_status()
+        found = r.json().get("places") or []
+    except (requests.RequestException, ValueError) as e:
+        # the message is the error's type only: a request error can carry the key
+        print(f"    Google Places failed ({type(e).__name__})")
+        return []
+    out = [{"title": (p.get("displayName") or {}).get("text") or "", "href": p["websiteUri"], "body": "",
+            "phone": p.get("internationalPhoneNumber") or p.get("nationalPhoneNumber") or ""}
+           for p in found if p.get("websiteUri")]
+    print(f"    (Google Places answered: {len(found)} places, {len(out)} with a website)")
+    return out
