@@ -252,7 +252,24 @@ def test_every_approved_industry_has_a_follow_up():
     missing = [f"followup{n}/{k}" for n in (1, 2) for k in approved
                if not sender.followup_template({"industry": k}, n)]
     assert missing == []
-    assert sorted(sender.FOLLOWUP_OFFERS) == sorted(approved)
+    assert set(approved) <= set(sender.FOLLOWUP_OFFERS)
+
+
+def test_every_industry_with_an_offer_has_its_follow_ups_written():
+    """An industry gets an offer when its emails are written, before it is approved: approving
+    it in uses.yaml must be all that's left to do."""
+    for k in sender.FOLLOWUP_OFFERS:
+        assert (sender.TEMPLATE_DIR / f"{k}.txt").exists(), k
+        for n in (1, 2):
+            path = sender.followup_template({"industry": k}, n)
+            assert path, f"followup{n}/{k}"
+        assert sender.FOLLOWUP1_LINE in sender.followup_template({"industry": k}).read_text(encoding="utf-8")
+
+
+def test_written_but_unapproved_industries_get_nothing(world):
+    import personalise
+    for k in ("microfinance", "insurance", "health", "logistics", "ecommerce", "real_estate"):
+        assert not personalise.approved({"industry": k}), k
 
 
 @pytest.mark.parametrize("start, expected", [

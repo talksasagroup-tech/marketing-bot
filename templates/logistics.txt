@@ -1,19 +1,18 @@
-Subject: SMS tracking updates for your customers — can we meet?
+Subject: Pickup and delivery updates by SMS
 Hello {company} team,
 
 {opener}
 
-I'm {sender} from TalkSasa Communications in Nairobi. Courier and logistics companies use our bulk SMS for {uses}.
+I'm {sender} from TalkSasa Communications in Nairobi. We help courier and logistics companies send pickup confirmations, parcel tracking updates and delivery notices by SMS.
 
-I'd like to understand how you reach your customers today and whether we could support you.
-
-Would you be open to a short visit to your office or a quick call? Any day that suits you works for us.
+Who handles SMS on your side today? If it's worth comparing, I can send over our rates and API docs.
 
 {attachment_line}
 
 Kind regards,
 {sender}
-{our_company}
-{phone}
+TalkSasa Communications Ltd
++254 762 000 008
++254 712 295 880
 {website}
 {profile_line}

@@ -206,12 +206,16 @@ MAX_FOLLOWUPS = 2
 # follow-up waits until then
 OUT_OF_OFFICE_HOLD_DAYS = 7
 # {offer} in the follow-ups, by industry. An industry missing here can't get a follow-up
-# built, so it is never sent one by mistake.
+# built, so it is never sent one by mistake. The industries after the first eight have
+# their emails written but aren't approved in uses.yaml yet, so nothing goes to them until
+# someone approves them there.
 VISIT_OFFER = "I'd be glad to visit or set up a quick call, whichever suits you."
 API_OFFER = "I can send over our rates and API docs."
 FOLLOWUP_OFFERS = {"church": VISIT_OFFER, "sacco": VISIT_OFFER, "school": VISIT_OFFER,
                    "fintech": API_OFFER, "hr_payroll": API_OFFER, "saas": API_OFFER,
-                   "tech_startup": API_OFFER, "digital_lender": API_OFFER}
+                   "tech_startup": API_OFFER, "digital_lender": API_OFFER,
+                   "microfinance": VISIT_OFFER, "insurance": VISIT_OFFER, "health": VISIT_OFFER,
+                   "real_estate": VISIT_OFFER, "logistics": API_OFFER, "ecommerce": API_OFFER}
 FOLLOWUP_USES = 2  # {uses} in a follow-up: the first two on the industry's list
 # Follow-up 1's first line, and what replaces it for a lead whose first email had older
 # wording than its template has now (that email may not have named these uses)

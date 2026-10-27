@@ -1,19 +1,18 @@
-Subject: SMS reminders for your borrowers — can we meet?
+Subject: Repayment reminders by SMS
 Hello {company} team,
 
 {opener}
 
-I'm {sender} from TalkSasa Communications in Nairobi. Lenders use our bulk SMS for {uses}.
+I'm {sender} from TalkSasa Communications in Nairobi. We help microfinance banks and lenders send repayment reminders, loan approval messages and overdue notices by SMS.
 
-I'd like to understand how you reach your clients today and whether we could support you.
-
-Would you be open to a short visit to your office or a quick call? Any day that suits you works for us.
+How do you reach your borrowers today? If SMS could help, I'd be glad to visit or set up a quick call, whichever suits you.
 
 {attachment_line}
 
 Kind regards,
 {sender}
-{our_company}
-{phone}
+TalkSasa Communications Ltd
++254 762 000 008
++254 712 295 880
 {website}
 {profile_line}

@@ -1,0 +1,9 @@
+Hello {company} team,
+
+I won't keep filling your inbox. If SMS becomes useful for you later, just reply to this email and I'll get back to you the same day.
+
+Kind regards,
+{sender}
+TalkSasa Communications Ltd
++254 762 000 008
++254 712 295 880

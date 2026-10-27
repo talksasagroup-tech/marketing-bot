@@ -2,7 +2,8 @@
 # approved: true  = leads in this industry may be emailed.
 #           false = the sender skips them and leaves them waiting.
 # uses: the approved SMS uses, for templates that have a {uses} slot (the first three
-#       are used). The seven approved templates name their uses in their own fixed text.
+#       are used). The approved templates name their uses in their own fixed text, and
+#       follow-ups name the first two uses here, so keep them in the same order.
 default:
   approved: false
   uses: [customer updates, reminders, alerts, promotions]
