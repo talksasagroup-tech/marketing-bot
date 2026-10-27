@@ -49,8 +49,8 @@ def mail(smtp, monkeypatch):
     smtp["messages"] = []
     real = sender.deliver
 
-    def deliver(s, lead, msg, tname, followup=False):
-        real(s, lead, msg, tname, followup)
+    def deliver(s, lead, msg, tname, followup=False, mailbox=None):
+        real(s, lead, msg, tname, followup, mailbox)
         smtp["messages"].append(msg)
 
     monkeypatch.setattr(sender, "deliver", deliver)

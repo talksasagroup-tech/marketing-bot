@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS sent (
     sent_body TEXT,
     -- template, personal, followup or followup2; and which subject line a first email used
     variant TEXT,
-    subject_no INTEGER
+    subject_no INTEGER,
+    -- which sending mailbox it went from (config.mailboxes key); NULL is mailbox 1
+    mailbox TEXT
 );
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY,
@@ -157,6 +159,7 @@ CREATE TABLE IF NOT EXISTS send_claims (
     claimed_on TEXT,
     claimed_at TEXT DEFAULT CURRENT_TIMESTAMP,
     owner TEXT,
+    mailbox TEXT,
     PRIMARY KEY (lead_id, step)
 );
 -- settings an admin changed in the CRM (profile_url, profile_label, attach_pdf); each one takes
@@ -332,6 +335,7 @@ def init():
         for table, col, kind in (("sent", "sent_subject", "TEXT"), ("sent", "sent_body", "TEXT"),
                                  ("sent", "sent_at", "TEXT"), ("sent", "variant", "TEXT"),
                                  ("sent", "subject_no", "INTEGER"), ("replies", "realerted_at", "TEXT"),
+                                 ("sent", "mailbox", "TEXT"), ("send_claims", "mailbox", "TEXT"),
                                  ("leads", "opener", "TEXT"), ("leads", "use_case", "TEXT"), ("leads", "subject_topic", "TEXT"),
                                  ("leads", "uses", "TEXT"),
                                  ("leads", "confidence", "REAL"), ("leads", "est_year", "INTEGER"),
@@ -493,16 +497,19 @@ def find_lead_by_email(email):
     with conn() as c:
         return c.execute("SELECT * FROM leads WHERE email=?", (email.lower(),)).fetchone()
 
-def record_sent(lead_id, message_id, template, subject=None, body=None, subject_variant=None, subject_no=None):
+def record_sent(lead_id, message_id, template, subject=None, body=None, subject_variant=None, subject_no=None,
+                mailbox=None):
     """Record an email that went out. Its send claim, if any, is removed in the same
     transaction, so the email counts once towards the daily limit. subject_no is which of
-    the template's subject lines a first email used (1, 2, ...), for the subject test."""
+    the template's subject lines a first email used (1, 2, ...), for the subject test;
+    mailbox is the sending mailbox's key (None or "1" for mailbox 1)."""
     with conn() as c:
         c.execute("DELETE FROM send_claims WHERE lead_id=?", (lead_id,))
         sent_id = c.execute("INSERT INTO sent (lead_id, message_id, template, sent_subject, sent_body,"
-                            " variant, subject_no, sent_on, sent_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) RETURNING id",
+                            " variant, subject_no, mailbox, sent_on, sent_at)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) RETURNING id",
                             (lead_id, message_id, template, subject, body, subject_variant, subject_no,
-                             today())).fetchone()[0]
+                             None if mailbox in (None, "1") else mailbox, today())).fetchone()[0]
         step = c.execute("SELECT COUNT(*) FROM sent WHERE lead_id=?", (lead_id,)).fetchone()[0]
         # the campaign is the niche template the email was built from
         log_event(c, lead_id, "email_sent", sent_id=sent_id, step=step, subject=subject,
@@ -543,11 +550,14 @@ def leads_on_domain(domain):
         return c.execute("SELECT * FROM leads WHERE lower(email) LIKE ? ORDER BY id",
                          ("%@" + domain.lower(),)).fetchall()
 
-def bounce_stats(days):
+def bounce_stats(days, mailbox=None):
     """(companies emailed, how many of them bounced), for the companies first emailed in the
     last `days` days. A lead counts once, whether its email went out or its address was
     refused at sending; a bounce counts whenever it arrived. Leads added by hand (test
-    leads) are left out."""
+    leads) are left out. With `mailbox`, only the leads whose first email went from that
+    mailbox (an address refused at sending has no sent email, so it counts under mailbox 1)."""
+    by_box = ("" if mailbox is None else
+              " AND COALESCE((SELECT f.mailbox FROM sent f WHERE f.lead_id = l.id ORDER BY f.id LIMIT 1), '1') = ?")
     with conn() as c:
         rows = c.execute(f"""
             SELECT l.id,
@@ -556,9 +566,9 @@ def bounce_stats(days):
             FROM lead_events e JOIN leads l ON l.id = e.lead_id
             WHERE (e.event_type = 'email_sent'
                    OR (e.event_type = 'bounced' AND e.detail LIKE '%"by": "send"%'))
-              AND {real('l')}
+              AND {real('l')}{by_box}
             GROUP BY l.id HAVING MIN(e.created_at) >= datetime('now', ?)""",
-                         (f"-{int(days)} days",)).fetchall()
+                         ((mailbox,) if mailbox is not None else ()) + (f"-{int(days)} days",)).fetchall()
     return len(rows), sum(r["bounced"] for r in rows)
 
 def sent_subjects():
@@ -633,11 +643,12 @@ def lock_holder(name):
     with conn() as c:
         return c.execute("SELECT * FROM locks WHERE name=?", (name,)).fetchone()
 
-def claim_send(lead_id, followup, daily_limit, owner=None):
+def claim_send(lead_id, followup, daily_limit, owner=None, mailbox=None, mailbox_limit=None):
     """Claim one email just before it goes to the mail server. Returns None if it may go,
     otherwise why not. Rechecked here, in one write transaction, whatever the batch was
     built from: the lead still at the right status, not suppressed, not already emailed
-    (or being emailed), and today's sends plus emails in flight under the daily limit.
+    (or being emailed), and today's sends plus emails in flight under the daily limit, and
+    under the sending mailbox's own limit when it has one (mailbox_limit).
     followup is 0 for a first email, else the follow-up's number."""
     step = int(followup) + 1
     day = today()  # the same day sent_today counts
@@ -664,9 +675,33 @@ def claim_send(lead_id, followup, daily_limit, owner=None):
                 + c.execute("SELECT COUNT(*) FROM send_claims WHERE claimed_on=?", (day,)).fetchone()[0])
         if used >= daily_limit:
             return f"daily limit of {daily_limit} reached"
-        c.execute("INSERT INTO send_claims (lead_id, step, claimed_on, owner) VALUES (?,?,?,?)",
-                  (lead_id, step, day, owner))
+        box = mailbox or "1"
+        if mailbox_limit is not None and _mailbox_used(c, box, day) >= mailbox_limit:
+            return f"mailbox limit of {mailbox_limit} reached for mailbox {box}"
+        c.execute("INSERT INTO send_claims (lead_id, step, claimed_on, owner, mailbox) VALUES (?,?,?,?,?)",
+                  (lead_id, step, day, owner, None if box == "1" else box))
     return None
+
+
+def _mailbox_used(c, box, day):
+    """Emails sent from this mailbox on `day`, plus those being sent from it now."""
+    return (c.execute("SELECT COUNT(*) FROM sent WHERE sent_on=? AND COALESCE(mailbox, '1')=?", (day, box)).fetchone()[0]
+            + c.execute("SELECT COUNT(*) FROM send_claims WHERE claimed_on=? AND COALESCE(mailbox, '1')=?",
+                        (day, box)).fetchone()[0])
+
+
+def mailbox_sent_today(box):
+    with conn() as c:
+        return _mailbox_used(c, box, today())
+
+
+def first_mailbox_of(lead_id):
+    """The mailbox a lead's first email went from ("1" for mailbox 1), or None if never emailed:
+    its follow-ups go from the same one, so they stay in the same conversation."""
+    with conn() as c:
+        row = c.execute("SELECT COALESCE(mailbox, '1') FROM sent WHERE lead_id=? ORDER BY id LIMIT 1",
+                        (lead_id,)).fetchone()
+    return row[0] if row else None
 
 # A lead whose email failed this many times is not tried again by the bot (a mail server that
 # keeps refusing it would otherwise take a slot every day). Its failures stay in lead_events.

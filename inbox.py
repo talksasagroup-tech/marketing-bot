@@ -190,9 +190,9 @@ def outreach_subjects():
 def answers_our_email(headers, subject, subjects):
     """Whether a message is a reply to one of our emails, whoever sent it: it answers a
     Message-ID that LeadBot made, or its subject contains one of our outreach subjects."""
-    domain = config.FROM_EMAIL.rsplit("@", 1)[-1].lower()
+    domains = {mb["email"].rsplit("@", 1)[-1].lower() for mb in config.mailboxes()}  # any of our mailboxes
     refs = f"{headers.get('In-Reply-To', '')} {headers.get('References', '')}"
-    if any(d.lower() == domain for d in LEADBOT_MESSAGE_ID.findall(refs)):
+    if any(d.lower() in domains for d in LEADBOT_MESSAGE_ID.findall(refs)):
         return True
     return any(s in subject.lower() for s in subjects)
 
@@ -215,15 +215,30 @@ def mail_folders(box):
     return sorted(names, key=lambda n: n.upper() != "INBOX")
 
 
-def first_mailbox():
-    return (config.IMAP_USER or "").lower() == (config.FIRST_IMAP_USER or "").lower()
+def first_mailbox(account=None):
+    """Whether this IMAP login (IMAP_USER if not given) is the first one LeadBot ever read."""
+    return ((account or config.IMAP_USER) or "").lower() == (config.FIRST_IMAP_USER or "").lower()
 
 
-def mail_key(folder, uid):
+def mail_key(folder, uid, account=None):
     """How a message is remembered: its UID in INBOX (as it always was), folder:UID elsewhere,
-    with "account/" in front for any mailbox but the first one."""
+    with "account/" in front for any mailbox but the first one. account is the IMAP login
+    being read (IMAP_USER if not given)."""
     key = uid if folder.upper() == "INBOX" else f"{folder}:{uid}"
-    return key if first_mailbox() else f"{config.IMAP_USER.lower()}/{key}"
+    account = account or config.IMAP_USER
+    return key if first_mailbox(account) else f"{account.lower()}/{key}"
+
+
+def accounts():
+    """Every inbox to read: each sending mailbox's IMAP login once, mailbox 1's first. Replies,
+    bounces and unsubscribes come back to the mailbox an email went from."""
+    out, seen = [], set()
+    for mb in config.mailboxes():
+        login = ((mb["imap_host"] or "").lower(), (mb["imap_user"] or "").lower())
+        if login not in seen and mb["imap_user"]:
+            seen.add(login)
+            out.append(mb)
+    return out or config.mailboxes()[:1]
 
 
 def quoted(folder):
@@ -257,19 +272,45 @@ def check_once(catch_up=False):
     on Telegram, without the AI and without acting on it (bounces and auto-replies are
     still recognised by their headers). What still doesn't match stays skipped."""
     send_alerts()  # alerts left over from a check when Telegram was unreachable
-    box = imaplib.IMAP4_SSL(config.IMAP_HOST)
-    box.login(config.IMAP_USER, config.IMAP_PASS)
     since = since_first_send()
     handled = 0
     skipped, newly_skipped, caught = db.skipped_uids(), [], []
     subjects = outreach_subjects()
+    for n, mb in enumerate(accounts()):
+        try:
+            handled += _check_account(mb, since, subjects, catch_up, skipped, newly_skipped, caught)
+        except CHECK_ERRORS as e:
+            if n == 0 or isinstance(e, db.Error):
+                raise  # mailbox 1, or the database: checked() counts it and alerts after a few
+            # another mailbox can't be reached: its mail waits for the next check, mailbox 1's doesn't
+            print(f"  Couldn't read mailbox {mb['key']} ({mb['imap_user']}): {e}")
+            flag = f"mailbox_{mb['key']}_unreadable_alerted"
+            if db.get_setting(flag) != db.today():  # one alert a day, not one every check
+                db.queue_alert(None, f"⚠️ LeadBot couldn't read mailbox {mb['key']} ({mb['imap_user']}): "
+                                     f"{type(e).__name__}. Replies sent to it wait until it can be read.")
+                db.set_setting(flag, db.today())
+    db.add_skipped(newly_skipped)
+    db.unskip(caught)
+    # Heartbeat for the dashboard: when the inbox was last checked
+    (Path(__file__).parent / "last_check.txt").write_text(datetime.now().isoformat(timespec="seconds"))
+    remind_late()
+    send_alerts()
+    return handled
+
+
+def _check_account(mb, since, subjects, catch_up, skipped, newly_skipped, caught):
+    """check_once for one mailbox's inbox. Returns how many messages it handled."""
+    handled = 0
+    box = imaplib.IMAP4_SSL(mb["imap_host"])
+    box.login(mb["imap_user"], mb["imap_pass"])
+    account = mb["imap_user"]
     for folder in mail_folders(box) if since else []:
         if box.select(quoted(folder))[0] != "OK":
             continue
-        if folder.upper() == "INBOX" and first_mailbox():  # those UIDs are the first mailbox's
+        if folder.upper() == "INBOX" and first_mailbox(account):  # those UIDs are the first mailbox's
             fill_message_ids(box)
         for uid in box.uid("search", None, "SINCE", since)[1][0].split():
-            key = mail_key(folder, uid.decode())
+            key = mail_key(folder, uid.decode(), account)
             if db.reply_seen(key) or (key in skipped) != catch_up:
                 continue  # a normal check leaves skipped mail alone; a catch-up reads only that
             try:
@@ -283,14 +324,7 @@ def check_once(catch_up=False):
                 if catch_up:
                     caught.append(key)
                 handled += 1
-
-    db.add_skipped(newly_skipped)
-    db.unskip(caught)
     box.logout()
-    # Heartbeat for the dashboard: when the inbox was last checked
-    (Path(__file__).parent / "last_check.txt").write_text(datetime.now().isoformat(timespec="seconds"))
-    remind_late()
-    send_alerts()
     return handled
 
 

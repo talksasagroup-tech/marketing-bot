@@ -103,3 +103,56 @@ TAVILY_MONTHLY_CAP = int(env("TAVILY_MONTHLY_CAP", "900"))
 # PLACES_MONTHLY_CAP stops the calls for the rest of the month.
 GOOGLE_PLACES_API_KEY = env("GOOGLE_PLACES_API_KEY", "")
 PLACES_MONTHLY_CAP = int(env("PLACES_MONTHLY_CAP", "500"))
+
+
+# --- More than one sending mailbox ---
+# Mailbox 1 is the SMTP_*/IMAP_*/FROM_* settings above. More can be added in .env as
+# MAILBOX_2_EMAIL, MAILBOX_2_SMTP_PASS and so on (see mailboxes()), best on a separate domain
+# with SPF, DKIM and DMARC set up. Each new mailbox warms up: it sends MAILBOX_WARMUP_START a day
+# in its first week and MAILBOX_WARMUP_STEP more each week after, up to its MAX_PER_DAY. Every
+# mailbox together still sends no more than daily_limit().
+MAX_MAILBOXES = 9
+MAILBOX_WARMUP_START = 5
+MAILBOX_WARMUP_STEP = 5
+MAILBOX_MAX_PER_DAY = 30
+
+
+def mailboxes():
+    """Every sending mailbox as a dict: key ("1", "2", ...), email, name, smtp_host, smtp_port,
+    smtp_user, smtp_pass, imap_host, imap_user, imap_pass, start_date (YYYY-MM-DD or None) and
+    max_per_day (None: no limit of its own, only daily_limit()). Read each time, so a change
+    to the settings is used from the next run. A new mailbox's host settings default to
+    mailbox 1's and its login to its own address."""
+    boxes = [dict(key="1", email=FROM_EMAIL, name=FROM_NAME, smtp_host=SMTP_HOST, smtp_port=SMTP_PORT,
+                  smtp_user=SMTP_USER, smtp_pass=SMTP_PASS, imap_host=IMAP_HOST, imap_user=IMAP_USER,
+                  imap_pass=IMAP_PASS, start_date=env("MAILBOX_1_START_DATE") or None,
+                  max_per_day=int(env("MAILBOX_1_MAX_PER_DAY")) if env("MAILBOX_1_MAX_PER_DAY") else None)]
+    for n in range(2, MAX_MAILBOXES + 1):
+        email = (env(f"MAILBOX_{n}_EMAIL") or "").strip()
+        if not email:
+            continue
+        get = lambda name, default=None: env(f"MAILBOX_{n}_{name}") or default  # noqa: E731
+        boxes.append(dict(key=str(n), email=email, name=get("NAME", FROM_NAME),
+                          smtp_host=get("SMTP_HOST", SMTP_HOST), smtp_port=int(get("SMTP_PORT", SMTP_PORT)),
+                          smtp_user=get("SMTP_USER", email), smtp_pass=get("SMTP_PASS"),
+                          imap_host=get("IMAP_HOST", IMAP_HOST), imap_user=get("IMAP_USER", email),
+                          imap_pass=get("IMAP_PASS", get("SMTP_PASS")),
+                          # a mailbox with no start date is treated as new today: the slowest start
+                          start_date=get("START_DATE"), max_per_day=int(get("MAX_PER_DAY", MAILBOX_MAX_PER_DAY))))
+    return boxes
+
+
+def mailbox_limit(box, today):
+    """How many emails this mailbox may send on `today` (a date): its warm-up step, at most its
+    max_per_day; None when it has no limit of its own (mailbox 1 unless MAILBOX_1_* says so)."""
+    from datetime import date
+    if box["max_per_day"] is None:
+        return None
+    if box["key"] == "1" and not box["start_date"]:
+        return box["max_per_day"]
+    try:
+        start = date.fromisoformat(box["start_date"] or "")
+    except ValueError:
+        start = today
+    weeks = max(0, (today - start).days) // 7
+    return min(box["max_per_day"], MAILBOX_WARMUP_START + MAILBOX_WARMUP_STEP * weeks)

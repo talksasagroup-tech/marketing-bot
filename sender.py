@@ -31,7 +31,7 @@ SENT_NAMES = ("Sent", "Sent Items", "Sent Messages", "Sent Mail", "INBOX.Sent",
 # What the website line reads as. In the HTML email it is a link to config.WEBSITE
 WEBSITE_LABEL = "TalkSasa"
 _warned = set()
-_sent_folder = None  # found once per run
+_sent_folder = {}  # mailbox's IMAP login -> its Sent folder, found once per run
 
 
 def _warn(text):
@@ -147,49 +147,53 @@ def _link(m):
     return f'<a href="{url}">{WEBSITE_LABEL if ours else url}</a>'
 
 
-def to_html(text):
+def to_html(text, from_email=None):
     """A plain copy of the text: paragraphs and clickable links, nothing else,
-    so it reads like a normal personal email."""
+    so it reads like a normal personal email. The unsubscribe link writes to from_email
+    (the sending mailbox), FROM_EMAIL if not given."""
     paras = []
     for block in re.split(r"\n\s*\n", text.strip()):
         block = html.escape(block, quote=False)
         block = re.sub(r"https?://[^\s<]+[^\s<.,;:!?)]", _link, block)
         paras.append("<p>" + block.replace("\n", "<br>\n") + "</p>")
-    unsubscribe = (f"mailto:{config.FROM_EMAIL}?subject=unsubscribe"
+    unsubscribe = (f"mailto:{from_email or config.FROM_EMAIL}?subject=unsubscribe"
                    "&amp;body=Please%20unsubscribe%20me")
     paras.append(f"<p>--<br>\nIf you'd rather not hear from us, "
                  f'<a href="{unsubscribe}">click here to unsubscribe</a>.</p>')
     return "<html><body>\n" + "\n".join(paras) + "\n</body></html>"
 
 
-def build(lead):
-    """The first email to a lead: its industry's template, with the PDF if there is one."""
+def build(lead, mailbox=None):
+    """The first email to a lead: its industry's template, with the PDF if there is one.
+    mailbox is the sending mailbox (config.mailboxes), mailbox 1 if not given."""
     tname, subjects, body = load_templates(lead["industry"])
     _, subject = subject_for(lead, subjects)
-    return compose(lead, fill(subject, lead), body, attachment()), tname
+    return compose(lead, fill(subject, lead), body, attachment(), mailbox=mailbox), tname
 
 
-def compose(lead, subject, body, pdf=None, in_reply_to=None, extra=None, references=None):
+def compose(lead, subject, body, pdf=None, in_reply_to=None, extra=None, references=None, mailbox=None):
     """The email itself: the template body filled in for this lead, as plain text and HTML,
     with our unsubscribe footer, and the PDF if given. in_reply_to (a Message-ID) makes it
     part of that email's thread; references lists the thread's Message-IDs oldest first
-    (default: in_reply_to alone). `extra` is passed on to fill."""
+    (default: in_reply_to alone). `extra` is passed on to fill. It goes out from `mailbox`
+    (config.mailboxes; mailbox 1 if not given), and unsubscribe requests go back to it."""
+    box = mailbox or config.mailboxes()[0]
     def tidy(t):
         return re.sub(r"\n{3,}", "\n\n", t.rstrip())  # close the gap left by an empty placeholder line
     text = tidy(fill(body, lead, attached=bool(pdf), extra=extra))
-    html_body = to_html(tidy(fill(body, lead, attached=bool(pdf), for_html=True, extra=extra)))
+    html_body = to_html(tidy(fill(body, lead, attached=bool(pdf), for_html=True, extra=extra)), box["email"])
     text += ("\n\n--\nIf you'd rather not hear from us, just reply \"unsubscribe\" "
              "and we won't email you again.")
     msg = EmailMessage()
-    msg["From"] = formataddr((config.FROM_NAME, config.FROM_EMAIL))
+    msg["From"] = formataddr((box["name"], box["email"]))
     msg["To"] = lead["email"]
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=config.FROM_EMAIL.split("@")[1])
+    msg["Message-ID"] = make_msgid(domain=box["email"].split("@")[1])
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = " ".join(references or [in_reply_to])
-    msg["List-Unsubscribe"] = f"<mailto:{config.FROM_EMAIL}?subject=unsubscribe>"
+    msg["List-Unsubscribe"] = f"<mailto:{box['email']}?subject=unsubscribe>"
     msg.set_content(text)
     msg.add_alternative(html_body, subtype="html")
     if pdf:  # turns the message into multipart/mixed: (plain + HTML) + PDF
@@ -253,7 +257,7 @@ def old_wording(lead, thread):
     return not saved or subject_number(lead, saved) is None
 
 
-def build_followup(lead, n=1):
+def build_followup(lead, n=1, mailbox=None):
     """Follow-up n (1 or 2) to a lead's first email: its industry's follow-up template, no
     PDF, sent as a reply in the same thread. The subject is "Re: " + the subject the first
     email actually went out with (the template's subject only if none was saved).
@@ -274,8 +278,8 @@ def build_followup(lead, n=1):
     subject = first_subject if first_subject.lower().startswith("re:") else f"Re: {first_subject}"
     ids = [r["message_id"] for r in thread if r["message_id"]] or [lead.get("message_id")]
     ids = [i for i in ids if i]
-    msg = compose(lead, subject, body,
-                  in_reply_to=ids[-1] if ids else None, references=ids, extra=followup_values(lead))
+    msg = compose(lead, subject, body, in_reply_to=ids[-1] if ids else None, references=ids,
+                  extra=followup_values(lead), mailbox=mailbox)
     return msg, f"{path.parent.name}/{path.stem}"
 
 
@@ -328,11 +332,12 @@ def _folders(box):
     return out
 
 
-def find_sent_folder(box):
-    """The folder flagged \\Sent, otherwise the first of SENT_NAMES that exists."""
-    global _sent_folder
-    if _sent_folder:
-        return _sent_folder
+def find_sent_folder(box, login=None):
+    """The folder flagged \\Sent, otherwise the first of SENT_NAMES that exists. login says
+    whose mailbox it is, so each mailbox's is looked up once."""
+    login = (login or config.IMAP_USER or "").lower()
+    if login in _sent_folder:
+        return _sent_folder[login]
     folders = _folders(box)
     found = next((name for flags, name in folders if "\\sent" in flags), None)
     how = "flagged \\Sent by the server"
@@ -343,7 +348,7 @@ def find_sent_folder(box):
     if not found:
         raise LookupError("no Sent folder found. Folders: " + ", ".join(n for _, n in folders))
     print(f"Sent folder: {found} ({how})")
-    _sent_folder = found
+    _sent_folder[login] = found
     return found
 
 
@@ -352,14 +357,15 @@ def wire_bytes(msg):
     return msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))
 
 
-def save_to_sent(msg, sent_at):
-    """File a copy of a sent email in the Sent folder, marked read.
+def save_to_sent(msg, sent_at, mailbox=None):
+    """File a copy of a sent email in the sending mailbox's Sent folder, marked read.
     A failure here is only a warning: the email has already gone out."""
+    mb = mailbox or config.mailboxes()[0]
     try:
-        box = imaplib.IMAP4_SSL(config.IMAP_HOST)
+        box = imaplib.IMAP4_SSL(mb["imap_host"])
         try:
-            box.login(config.IMAP_USER, config.IMAP_PASS)
-            folder = find_sent_folder(box)
+            box.login(mb["imap_user"], mb["imap_pass"])
+            folder = find_sent_folder(box, mb["imap_user"])
             quoted = '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
             typ, data = box.append(quoted, "\\Seen", imaplib.Time2Internaldate(sent_at),
                                    wire_bytes(msg))
@@ -377,7 +383,7 @@ def save_to_sent(msg, sent_at):
         return False
 
 
-def deliver(smtp, lead, msg, tname, followup=0):
+def deliver(smtp, lead, msg, tname, followup=0, mailbox=None):
     """Send one email, record exactly what went out, and file it in Sent. `followup` is 0 for
     the first email, else the follow-up's number (1 or 2).
     Every send goes through here, so this is also where the limits are kept: a first email
@@ -400,8 +406,9 @@ def deliver(smtp, lead, msg, tname, followup=0):
     variant = ("followup" if followup == 1 else f"followup{followup:d}" if followup
                else "personal" if personalise.picked_uses(lead) else "template")
     subject_no = None if followup else subject_number(lead, str(msg["Subject"]))
-    db.record_sent(lead["id"], msg["Message-ID"], tname, str(msg["Subject"]), plain_of(msg), variant, subject_no)
-    save_to_sent(msg, sent_at)
+    key = mailbox["key"] if mailbox else None
+    db.record_sent(lead["id"], msg["Message-ID"], tname, str(msg["Subject"]), plain_of(msg), variant, subject_no, key)
+    save_to_sent(msg, sent_at, mailbox)
 
 
 def plain_of(msg):
@@ -563,6 +570,9 @@ def plan(dry_run=False):
     not ranked yet are shown in the order they would have without those, and leads not
     scored yet are left out as below MIN_SCORE."""
     remaining = config.daily_limit() - db.sent_today()
+    room = room_today(sending_mailboxes(quiet=True))  # the mailboxes' own limits, when they have them
+    if room is not None:
+        remaining = min(remaining, room)
     if remaining <= 0:
         return []
     # Follow-ups first: they fall due on a set day, and a second note is answered more often
@@ -644,40 +654,150 @@ def _dry_run():
         print("=" * 60, f"\n{f'FOLLOW-UP {followup:d}' if followup else 'FIRST EMAIL'}\nTo: {msg['To']}\n"
               f"Subject: {msg['Subject']}\n" + ("" if followup else personal_lines(lead) + "\n")
               + f"\n{plain_of(msg)}")
+    boxes = config.mailboxes()
+    if len(boxes) > 1:
+        usable = {mb["key"] for mb in sending_mailboxes(quiet=True)}
+        for mb in boxes:
+            room = mailbox_room(mb)
+            print(f"Mailbox {mb['key']} {mb['email']}: "
+                  + ("resting (bounces)" if mb["key"] not in usable
+                     else "no limit of its own" if room is None else f"{room} more today"))
     print(f"\n(dry run) would send {len(due)} follow-ups and {len(batch) - len(due)} first emails. "
           "Nothing was sent, looked up or saved.")
+
+
+def mailbox_room(mb):
+    """How many more emails this mailbox may send today, or None if it has no limit of its own."""
+    limit = config.mailbox_limit(mb, date.fromisoformat(db.today()))
+    return None if limit is None else max(0, limit - db.mailbox_sent_today(mb["key"]))
+
+
+def mailbox_gate(mb):
+    """bounce_gate for one mailbox's own sends: why it must rest, or None. Only used with more
+    than one mailbox (with one, bounce_gate is the same thing)."""
+    emailed, bounced = db.bounce_stats(config.BOUNCE_WINDOW_DAYS, mb["key"])
+    if emailed < config.BOUNCE_MIN_SENDS or 100 * bounced / emailed <= config.BOUNCE_LIMIT_PERCENT:
+        return None
+    return (f"{bounced} of the {emailed} companies it emailed in the last {config.BOUNCE_WINDOW_DAYS} days "
+            f"bounced, over the {config.BOUNCE_LIMIT_PERCENT:g}% limit")
+
+
+def sending_mailboxes(quiet=False):
+    """The mailboxes first emails may go from today: every one set up, less any resting
+    because of its own bounces (mailbox_gate)."""
+    boxes = config.mailboxes()
+    if len(boxes) == 1:
+        return boxes
+    out = []
+    for mb in boxes:
+        why = mailbox_gate(mb)
+        if why and not quiet:
+            print(f"Mailbox {mb['key']} ({mb['email']}) is resting: {why}.")
+        if not why:
+            out.append(mb)
+    return out
+
+
+def room_today(boxes):
+    """How many first emails and follow-ups these mailboxes can still send today in all, or
+    None when none of them has a limit of its own."""
+    rooms = [mailbox_room(mb) for mb in boxes]
+    return None if any(r is None for r in rooms) else sum(rooms)
+
+
+def pick_mailbox(lead, followup, boxes, unusable):
+    """The mailbox to send this email from, or None if there is none today. A follow-up goes
+    from the mailbox its first email went from, so it stays in that conversation (mailbox 1 if
+    that one is no longer set up). A first email goes from the usable mailbox that has sent the
+    fewest today and still has room, so the day's emails are shared out. `unusable` holds the
+    keys of mailboxes paused or full for this run."""
+    if followup:
+        every = config.mailboxes()
+        key = db.first_mailbox_of(lead["id"]) or "1"
+        mb = next((b for b in every if b["key"] == key), every[0])
+        return None if mb["key"] in unusable else mb
+    open_ = [mb for mb in boxes if mb["key"] not in unusable and mailbox_room(mb) != 0]
+    if not open_:
+        return None
+    return min(open_, key=lambda mb: (db.mailbox_sent_today(mb["key"]), int(mb["key"])))
 
 
 def _send_batch(batch, owner):
     counts = {"sent": 0, "bounced": 0, "failed": 0, "skipped": 0}
     in_a_row = 0  # failures since the last email that went out
-    s = connect()
+    boxes = sending_mailboxes()
+    conns, unusable = {}, set()  # open connections by mailbox key; mailboxes paused or full
+
+    def connection(mb):
+        if mb["key"] not in conns:
+            conns[mb["key"]] = connect(mb)
+        return conns[mb["key"]]
+
+    def drop(mb):
+        close(conns.pop(mb["key"], None))
+
+    def pause(mb, why):
+        unusable.add(mb["key"])
+        drop(mb)
+        if len(config.mailboxes()) > 1:
+            print(f"Mailbox {mb['key']} ({mb['email']}) {why}. The others carry on.")
+
     try:
         for i, (lead, followup) in enumerate(batch, 1):
-            outcome = send_one(s, lead, followup, owner)
+            s = None
+            while s is None:  # a mailbox that can't be reached is paused, and the lead tries the next
+                mb = pick_mailbox(lead, followup, boxes, unusable)
+                if mb is None:
+                    break
+                try:
+                    s = connection(mb)
+                except (OSError, smtplib.SMTPException) as e:
+                    if len(boxes) == 1 and not counts["sent"] and not conns:
+                        raise  # the only mailbox can't be reached at all: as before mailboxes
+                    pause(mb, f"can't be reached ({e})")
+            if s is None:
+                if followup:
+                    print(f"[{i}/{len(batch)}] waiting: follow-up {followup:d} to {lead['email']} goes from "
+                          f"mailbox {db.first_mailbox_of(lead['id'])}, which can't send now")
+                    continue
+                print("No mailbox has room for more first emails today. The other leads stay waiting.")
+                break
+            outcome = send_one(s, lead, followup, owner, mb)
             if outcome == "reconnect":
                 # The connection dropped: reconnect once and try this lead again
-                close(s)
+                drop(mb)
                 try:
-                    s = connect()
+                    s = connection(mb)
                 except (OSError, smtplib.SMTPException) as e:
                     print(f"Lost the connection to the mail server and could not reconnect ({e}). "
                           f"Stopping: the other leads stay waiting for the next send.")
                     break
-                outcome = send_one(s, lead, followup, owner)
+                outcome = send_one(s, lead, followup, owner, mb)
                 if outcome == "reconnect":
                     print("Lost the connection to the mail server again. Stopping: the other "
                           "leads stay waiting for the next send.")
                     break
-            if outcome in ("stop", "limit"):
+            if outcome == "mailbox full":
+                unusable.add(mb["key"])
+                continue
+            if outcome == "stop":
+                # our sender or login was refused: this mailbox is done for the run, the others go on
+                pause(mb, "refused our sender or login")
+                if all(b["key"] in unusable for b in config.mailboxes()):
+                    break
+                continue
+            if outcome == "limit":
                 break
             counts[outcome] += 1
             in_a_row = in_a_row + 1 if outcome == "failed" else 0
-            print(f"[{i}/{len(batch)}] {outcome}{f' follow-up {followup:d}' if followup else ''} {lead['email']}")
+            sender_note = f" from mailbox {mb['key']}" if len(config.mailboxes()) > 1 else ""
+            print(f"[{i}/{len(batch)}] {outcome}{f' follow-up {followup:d}' if followup else ''} {lead['email']}{sender_note}")
             db.refresh_lock(SEND_LOCK, owner, LOCK_SECONDS)
             if outcome == "bounced" and bounce_gate():
                 _paused(bounce_gate())
                 break
+            if outcome == "bounced" and len(boxes) > 1 and mailbox_gate(mb):
+                pause(mb, f"is resting: {mailbox_gate(mb)}")
             if in_a_row >= MAX_FAILURES_IN_A_ROW:
                 print(f"{in_a_row} emails failed in a row, so the problem is probably not the leads. "
                       "Stopping: the other leads stay waiting for the next send.")
@@ -685,7 +805,8 @@ def _send_batch(batch, owner):
             if i < len(batch) and outcome != "skipped":
                 time.sleep(config.SEND_DELAY_SECONDS)
     finally:
-        close(s)
+        for s in conns.values():
+            close(s)
     print(f"Sent {counts['sent']}, bounced {counts['bounced']}, failed {counts['failed']}, "
           f"skipped {counts['skipped']} (failed leads stay waiting and are tried again next time).")
 
@@ -695,11 +816,13 @@ def _send_batch(batch, owner):
 MAX_FAILURES_IN_A_ROW = 3
 
 
-def connect():
-    """A logged-in SMTP connection. Gives up after 60 seconds without an answer."""
-    s = smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=60)
+def connect(mailbox=None):
+    """A logged-in SMTP connection to a sending mailbox (mailbox 1 if not given). Gives up
+    after 60 seconds without an answer."""
+    mb = mailbox or config.mailboxes()[0]
+    s = smtplib.SMTP(mb["smtp_host"], mb["smtp_port"], timeout=60)
     s.starttls()
-    s.login(config.SMTP_USER, config.SMTP_PASS)
+    s.login(mb["smtp_user"], mb["smtp_pass"])
     return s
 
 
@@ -710,7 +833,7 @@ def close(s):
         pass  # already gone
 
 
-def send_one(s, lead, followup=0, owner=None):
+def send_one(s, lead, followup=0, owner=None, mailbox=None):
     """Try to email one lead its first email (followup=0), or follow-up 1 or 2. Returns what happened:
     "sent", "bounced" (address refused), "failed" (this email didn't go out; the lead stays
     waiting and is tried again next time), "skipped" (no longer to be emailed: opted out,
@@ -719,20 +842,26 @@ def send_one(s, lead, followup=0, owner=None):
     "stop" (the server refuses our sender or login: no point going on).
     The email is claimed first (db.claim_send), which rechecks the lead and the daily limit
     at the last moment. Anything that goes wrong after the email has gone out is not caught
-    here, so the batch stops, and the claim stays, instead of risking a second email."""
-    why_not = db.claim_send(lead["id"], followup, config.daily_limit(), owner)
+    here, so the batch stops, and the claim stays, instead of risking a second email.
+    mailbox is the sending mailbox (config.mailboxes), mailbox 1 if not given; "mailbox full"
+    means that mailbox has reached its own limit for today."""
+    mb = mailbox or config.mailboxes()[0]
+    why_not = db.claim_send(lead["id"], followup, config.daily_limit(), owner, mb["key"],
+                            config.mailbox_limit(mb, date.fromisoformat(db.today())))
     if why_not:
         with db.conn() as c:
             db.log_event(c, lead["id"], "send_skipped", reason=why_not, followup=followup or None)
         print(f"  skipped {lead['email']}: {why_not}")
+        if why_not.startswith("mailbox limit"):
+            return "mailbox full"
         return "limit" if why_not.startswith("daily limit") else "skipped"
     try:
-        msg, tname = build_followup(lead, followup) if followup else build(lead)
+        msg, tname = build_followup(lead, followup, mb) if followup else build(lead, mb)
     except Exception as e:  # e.g. a template with a broken {placeholder}
         db.release_claim(lead["id"])
         return _failed(lead, f"could not build the email: {e}")
     try:
-        deliver(s, lead, msg, tname, followup)
+        deliver(s, lead, msg, tname, followup, mb)
     except (smtplib.SMTPException, OSError, RuntimeError):
         db.release_claim(lead["id"])  # raised before the email went out (see deliver)
         return _not_sent(sys.exc_info()[1], lead)

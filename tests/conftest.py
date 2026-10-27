@@ -6,6 +6,7 @@ schemas in), every test gets its own empty PostgreSQL schema instead:
     TEST_DATABASE_URL=postgresql://user:pw@127.0.0.1:5432/test python -m pytest
 """
 import os
+import smtplib
 import sys
 import uuid
 from pathlib import Path
@@ -120,20 +121,25 @@ def alerts(monkeypatch):
 @pytest.fixture
 def smtp(monkeypatch):
     """A fake mail server. errors[address] = exceptions to raise on its next attempts
-    (None = accept); connect_ok = how many connections succeed (None = all)."""
-    world = {"connects": 0, "delivered": [], "errors": {}, "connect_ok": None}
+    (None = accept); connect_ok = how many connections succeed (None = all);
+    refused_logins = SMTP users whose login is refused. sent = (to, From, login) per email."""
+    world = {"connects": 0, "delivered": [], "errors": {}, "connect_ok": None, "sent": [],
+             "refused_logins": set()}
 
     class FakeSMTP:
         def __init__(self, host, port, timeout=None):
             world["connects"] += 1
+            self.user = None
             if world["connect_ok"] is not None and world["connects"] > world["connect_ok"]:
                 raise ConnectionRefusedError("mail server down")
 
         def starttls(self):
             pass
 
-        def login(self, *a):
-            pass
+        def login(self, user=None, password=None):
+            if user in world["refused_logins"]:
+                raise smtplib.SMTPAuthenticationError(535, b"Authentication failed")
+            self.user = user
 
         def quit(self):
             pass
@@ -144,6 +150,7 @@ def smtp(monkeypatch):
             if error:
                 raise error
             world["delivered"].append(msg["To"])
+            world["sent"].append((msg["To"], msg["From"], self.user))
 
     monkeypatch.setattr(sender.smtplib, "SMTP", FakeSMTP)
     return world

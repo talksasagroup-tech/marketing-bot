@@ -112,10 +112,10 @@ def test_sender_refused_stops_at_once(waiting, smtp):
 def test_broken_template_skips_only_that_lead(waiting, smtp, monkeypatch):
     real_build = sender.build
 
-    def build(lead):
+    def build(lead, mailbox=None):
         if lead["email"] == "two@two.co.ke":
             raise KeyError("phone_number")
-        return real_build(lead)
+        return real_build(lead, mailbox)
 
     monkeypatch.setattr(sender, "build", build)
     sender.run()
