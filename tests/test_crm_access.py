@@ -110,7 +110,7 @@ def test_sales_lists_show_only_unclaimed_and_their_own(team):
     assert emails(asha, "open") == {"info@asha-open.com", "info@free-school.com"}
     assert emails(asha, "mine") == {"info@asha-open.com"}
     assert emails(asha, "closed") == {"info@asha-school.com"}
-    assert asha.get("/api/crm/leads?scope=open").json()["counts"] == {"open": 2, "waiting": 2, "unclaimed": 1, "mine": 1}
+    assert asha.get("/api/crm/leads?scope=open").json()["counts"] == {"open": 2, "waiting": 2, "unclaimed": 1, "mine": 1, "due": 0}
     assert emails(admin, "open") == {"info@asha-open.com", "info@ben-open.com", "info@free-school.com"}
     assert emails(admin, "closed") == {"info@asha-school.com", "info@ben-school.com"}
     assert [u["name"] for u in asha.get("/api/crm/users").json()["users"]] == ["Asha"]

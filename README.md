@@ -27,11 +27,11 @@ python main.py init
 
 ```bash
 python main.py scrape companies.csv   # add leads from your own list
-python main.py discover sacco --max 5 # or find leads by web search (see discover.py)
+python main.py discover sacco --max 5 # or find leads by web search (see discover.py); approve them in the CRM, To review
 python main.py verify                 # drop dead domains
 python main.py send --dry-run         # read 3 sample emails first
 python main.py preview                # one email, plain and HTML versions
-python main.py send                   # send today's batch (DAILY_LIMIT)
+python main.py send                   # send today's batch (DAILY_LIMIT, at most 10 unless DAILY_LIMIT_OVERRIDE=true)
 python main.py watch                  # leave running; alerts you on replies
 python main.py stats
 python main.py export                 # leads.csv, events.csv, replies.csv (join on lead_id)
@@ -44,6 +44,14 @@ To run unattended on Linux, add to crontab:
 0 9 * * 1-5  cd /path/to/leadbot && venv/bin/python main.py send
 */5 * * * *  cd /path/to/leadbot && venv/bin/python main.py inbox
 ```
+
+## Lead quality and the sales routine
+
+- **Leads found by web search wait for review.** `discover` only guesses an organisation's industry from the search that found it, so each new lead waits in the CRM's **To review** list (admins) until someone picks its industry and approves it, or marks it Not a fit. CSV and directory imports don't need review. With no category, `discover` searches only industries approved in `uses.yaml`.
+- **What's working** shows each web search's results (found, invalid, not a fit, bounced, replied), so weak searches can be removed from `discover.QUERIES`, and why lost leads were lost.
+- **In each lead:** a next step with a due date (due and overdue ones rise to the top of the list), a reason whenever a lead is marked lost, and a label picker on each reply to correct the AI. The change is kept in `reply_labels`. Opt-outs and bounces can't be relabelled.
+- **Health strip (admins):** inbox freshness and errors, the bounce pause, today's sends against the limit, unfinished sends, follow-ups due and leads to review. Three failed inbox checks in a row also send one Telegram alert.
+- **Safer by default:** a 4xx refusal from a mail server is retried rather than counted as a bounce, a DNS timeout leaves a lead to be checked again instead of marking it invalid, an opt-out from a company address stops every address on that company's domain, a lead whose email fails 3 times stops being tried, "today" is Nairobi's date, and `auto` catches up a missed 9am run later the same day.
 
 ## Templates
 
@@ -58,7 +66,7 @@ Columns: `company,website,industry,email`. Leave `email` blank to have it scrape
 - [ ] Separate outreach domain (not talksasa.co.ke), so spam flags can't hurt the main domain
 - [ ] SPF, DKIM and DMARC records set on that domain (check at mail-tester.com, aim for 9/10+)
 - [ ] Send a few test emails to your own Gmail and check they land in Inbox, not Spam
-- [ ] Start at `DAILY_LIMIT=20–25`, raise by ~10/day each week if bounces stay under 3%
+- [ ] Start at `DAILY_LIMIT=10` (the most the bot sends unless `DAILY_LIMIT_OVERRIDE=true`, which is announced on Telegram every run); raise it only if bounces stay under 3%
 - [ ] Confirm with your boss whether TalkSasa needs ODPC registration for this
 
 ## What each label does

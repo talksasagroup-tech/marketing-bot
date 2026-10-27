@@ -261,11 +261,11 @@ def followups_due():
     A lead that replied, bounced or unsubscribed is no longer at 'sent', so it gets none."""
     if not config.FOLLOWUPS_APPROVED:
         return []
-    today, suppressed = date.today(), db.suppressed_emails()
+    today, is_blocked = date.fromisoformat(db.today()), db.blocker()
     return [(lead, n) for n in range(1, MAX_FOLLOWUPS + 1) for lead in db.awaiting_followup(n)
             if personalise.approved(lead) and followup_template(lead, n)
             and business_days_after(date.fromisoformat(lead["sent_on"]), config.FOLLOWUP_AFTER_DAYS) <= today
-            and lead["email"] not in suppressed
+            and not is_blocked(lead["email"])
             and not db.recent_out_of_office(lead["id"], OUT_OF_OFFICE_HOLD_DAYS)]
 
 
@@ -436,7 +436,8 @@ def approved_waiting(quiet=False):
     """Waiting leads whose industry is approved in uses.yaml and whose need score is at
     least MIN_SCORE, in sending order (highest score first). The rest are skipped and left
     exactly as they are, so they go out once their industry is approved or their score
-    rises. A lead not scored yet counts as 0."""
+    rises. A lead not scored yet counts as 0. A lead whose email already failed to go out
+    MAX_SEND_FAILURES times is skipped too."""
     waiting = ranking.waiting()
     leads = [l for l in waiting if personalise.approved(l)]
     if len(leads) < len(waiting) and not quiet:
@@ -449,6 +450,12 @@ def approved_waiting(quiet=False):
         print(f"Skipped {len(low)} waiting leads with a need score below MIN_SCORE "
               f"({config.MIN_SCORE})" + (f", {unscored} of them not scored yet" if unscored else ""))
     low_ids = {l["id"] for l in low}
+    failures = db.failure_counts()
+    given_up = [l for l in leads if failures.get(l["id"], 0) >= db.MAX_SEND_FAILURES]
+    if given_up and not quiet:
+        print(f"Skipped {len(given_up)} waiting leads whose email failed to go out "
+              f"{db.MAX_SEND_FAILURES} times (see send_failed in their history)")
+    low_ids |= {l["id"] for l in given_up}
     return [l for l in leads if l["id"] not in low_ids]
 
 
@@ -519,7 +526,7 @@ def plan(dry_run=False):
     start years are looked up (WHOIS, websites), no scores saved and no AI asked, so leads
     not ranked yet are shown in the order they would have without those, and leads not
     scored yet are left out as below MIN_SCORE."""
-    remaining = config.DAILY_LIMIT - db.sent_today()
+    remaining = config.daily_limit() - db.sent_today()
     if remaining <= 0:
         return []
     # Follow-ups first: they fall due on a set day, and a second note is answered more often
@@ -539,9 +546,29 @@ def plan(dry_run=False):
     return due + [(lead, 0) for lead in leads]
 
 
+def limit_override_note():
+    """Says so, every run, when DAILY_LIMIT is above MAX_DAILY_LIMIT: raised by the override,
+    or held back because the override is off. None when the limit is as set."""
+    if config.DAILY_LIMIT <= config.MAX_DAILY_LIMIT:
+        return None
+    if config.DAILY_LIMIT_OVERRIDE:
+        return (f"DAILY_LIMIT_OVERRIDE is on: sending up to {config.DAILY_LIMIT} today, above the "
+                f"usual {config.MAX_DAILY_LIMIT}.")
+    return (f"DAILY_LIMIT is {config.DAILY_LIMIT}, but the limit is {config.MAX_DAILY_LIMIT} unless "
+            "DAILY_LIMIT_OVERRIDE=true is set in .env.")
+
+
 def run(dry_run=False):
-    if config.DAILY_LIMIT - db.sent_today() <= 0:
-        print(f"Daily limit of {config.DAILY_LIMIT} reached. Try again tomorrow.")
+    note = limit_override_note()
+    if note:
+        print(f"NOTE: {note}")
+        if config.DAILY_LIMIT_OVERRIDE and not dry_run:
+            try:
+                notify.send("⚠️ LeadBot " + note)
+            except Exception:
+                pass  # the note above says it too
+    if config.daily_limit() - db.sent_today() <= 0:
+        print(f"Daily limit of {config.daily_limit()} reached. Try again tomorrow.")
         return
     paused = bounce_gate()
     if paused and not dry_run:
@@ -657,7 +684,7 @@ def send_one(s, lead, followup=0, owner=None):
     The email is claimed first (db.claim_send), which rechecks the lead and the daily limit
     at the last moment. Anything that goes wrong after the email has gone out is not caught
     here, so the batch stops, and the claim stays, instead of risking a second email."""
-    why_not = db.claim_send(lead["id"], followup, config.DAILY_LIMIT, owner)
+    why_not = db.claim_send(lead["id"], followup, config.daily_limit(), owner)
     if why_not:
         with db.conn() as c:
             db.log_event(c, lead["id"], "send_skipped", reason=why_not, followup=followup or None)
@@ -682,9 +709,14 @@ def _not_sent(error, lead):
     """What send_one returns for an email the mail server or deliver's checks didn't send."""
     try:
         raise error
-    except smtplib.SMTPRecipientsRefused:
-        db.set_status(lead["id"], "bounced", "send")
-        return "bounced"
+    except smtplib.SMTPRecipientsRefused as e:
+        # Only a permanent refusal (5xx) means the address doesn't exist. A 4xx or 421 is the
+        # server saying "not now" (greylisting, busy): the lead stays waiting and is tried again.
+        code, msg = e.recipients.get(lead["email"]) or next(iter(e.recipients.values()), (None, b""))
+        if code is None or 500 <= int(code) < 600:
+            db.set_status(lead["id"], "bounced", "send")
+            return "bounced"
+        return _failed(lead, f"address refused for now: {code} {msg!r}", code)
     except (smtplib.SMTPSenderRefused, smtplib.SMTPAuthenticationError) as e:
         print(f"The mail server refused our sender or login ({e}). Stopping.")
         _failed(lead, str(e), getattr(e, "smtp_code", None))

@@ -1,14 +1,16 @@
-requests
-beautifulsoup4
-dnspython
-python-dotenv
-streamlit
-pandas
-ddgs
-psycopg[binary]
-tavily-python
-fastapi
-uvicorn
-python-whois
-pyyaml
-pdfplumber
+# Pinned to the versions the test suite last passed with (python -m pytest).
+# To upgrade: change a version, reinstall, run the tests, then commit.
+requests==2.34.2
+beautifulsoup4==4.15.0
+dnspython==2.9.0
+python-dotenv==1.2.4
+streamlit==1.66.1
+pandas==3.1.0
+ddgs==9.16.1
+psycopg[binary]==3.3.6
+tavily-python==0.8.5
+fastapi==0.162.0
+uvicorn==0.54.0
+python-whois==0.9.6
+pyyaml==6.0.3
+pdfplumber==0.11.10

@@ -8,6 +8,7 @@ events.csv
 replies.csv
 .auto_last_run
 last_check.txt
+inbox_error.txt
 previews.txt
 .pytest_cache/
 *.db-wal

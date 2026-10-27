@@ -1,12 +1,13 @@
 """Finds new companies with a web search (websearch.py: Tavily, or DuckDuckGo) and adds them as leads.
 
-  python main.py discover                  go through PRIORITY order
+  python main.py discover                  go through PRIORITY order (approved industries only)
   python main.py discover sacco --max 5    one category, stop after 5 new leads
 
 Each query is run with a random town from TOWNS in place of {town}.
 Some categories also have LIST_QUERIES: searches for pages that list many companies
 (accelerator and incubator portfolios). The company sites linked from those are visited too.
-Every lead found is also appended to discovered.csv so you can review it in Excel.
+Every lead found is also appended to discovered.csv so you can review it in Excel. Leads found
+here wait for an admin to confirm their industry in the CRM (To review) before the first email.
 """
 import csv
 import random
@@ -19,6 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import db
+import personalise
 import scraper
 import websearch
 
@@ -154,6 +156,11 @@ QUERIES = {
         "payments startup Kenya API",
         "digital wallet OR savings app Kenya contact us",
     ],
+    "hr_payroll": [
+        "payroll software Kenya contact us",
+        "HR and payroll outsourcing {town} Kenya",
+        "HRMS system Kenya payslips contact",
+    ],
     "saas": [
         "SaaS company Nairobi",
         "cloud software company Kenya contact us",
@@ -252,7 +259,7 @@ PORTFOLIO_PAGES_PER_SITE = 2
 # Search order when no category is given
 PRIORITY = [
     "sacco", "microfinance",
-    "tech_startup", "fintech", "saas", "ecommerce", "delivery_app", "edtech", "healthtech",
+    "tech_startup", "fintech", "saas", "hr_payroll", "ecommerce", "delivery_app", "edtech", "healthtech",
     "agritech", "proptech", "insurtech", "logistics_tech", "events_ticketing",
     "digital_marketing_agency", "coworking",
     "school", "college", "church", "chama", "health", "transport",
@@ -379,11 +386,12 @@ def consider(url, category, query, seen):
     if not email:
         print(f"    {domain}: no email found")
         return None
-    if db.is_suppressed(email):
+    if db.blocked(email):
         print(f"    {domain}: {email} is on the suppression list")
         return None
     name = company_name(title, domain)
-    if not db.add_lead(name, domain, category, email, "search", query, url):
+    # held for a person to confirm its industry: the search that found it is only a guess
+    if not db.add_lead(name, domain, category, email, "search", query, url, review_status="pending"):
         print(f"    {domain}: {email} already a lead")
         return None
     row = {"company": name, "website": domain, "industry": category,
@@ -475,13 +483,24 @@ def discover_category(category, limit, seen):
     return added
 
 
+def approved_categories():
+    """PRIORITY without the industries uses.yaml doesn't approve for sending: leads found
+    there would only wait. Name one (`discover school`) to search it anyway."""
+    approved = [c for c in PRIORITY if personalise.approved({"industry": c})]
+    skipped = [c for c in PRIORITY if c not in approved]
+    if skipped:
+        print(f"Not searching {len(skipped)} industries that aren't approved in uses.yaml: {', '.join(skipped)}")
+    return approved
+
+
 def run(category=None, max_new=DEFAULT_MAX):
     if category and category not in QUERIES:
         print(f"Unknown category '{category}'. Choose from: {', '.join(PRIORITY)}")
         return []
     seen = known_domains()
     added = []
-    for cat in ([category] if category else PRIORITY):
+    categories = [category] if category else approved_categories()
+    for cat in categories:
         if len(added) >= max_new:
             break
         print(f"[{cat}]")

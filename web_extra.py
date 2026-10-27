@@ -6,12 +6,13 @@ Add to web.py (two lines, after `app = FastAPI(...)`):
 
 Routes:
     GET /api/leads/{lead_id}/emails  -> every email sent to one lead + every reply, oldest first
+                                        (the dashboard's email history; web.py has no route of its own for it)
     GET /api/sent-today               -> who was emailed today
 
 Works with older and newer databases: if the sent table has no step,
 sent_subject or sent_body column yet, those fields come back as null.
 """
-from datetime import date
+
 
 from fastapi import APIRouter, HTTPException
 
@@ -79,7 +80,7 @@ def lead_emails(lead_id: int):
 
 @router.get("/api/sent-today")
 def sent_today():
-    today = date.today().isoformat()  # same rule the bot uses to count its daily limit
+    today = db.today()  # same rule the bot uses to count its daily limit
     with _conn() as c:
         sc = _cols(c, "sent")
         step = "s.step" if "step" in sc else "NULL"

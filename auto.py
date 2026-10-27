@@ -1,16 +1,18 @@
 """Runs LeadBot unattended. Leave `python main.py auto` running.
 
-Weekdays at 9am Nairobi time: discover, verify, personalise, then send (up to DAILY_LIMIT).
-The rest of the time: check the inbox every POLL_MINUTES.
+Weekdays from 9am Nairobi time: discover, verify, personalise, then send (up to the daily
+limit), once a day. If the bot wasn't running at 9 (a laptop asleep, a restart) the day's run
+happens as soon as it is, later that day. The rest of the time: check the inbox every POLL_MINUTES.
 """
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
 import config
 import db
+import inbox
 
-NAIROBI = timezone(timedelta(hours=3))  # Kenya has no daylight saving
+NAIROBI = config.NAIROBI
 RUN_HOUR = 9
 # Remembers the last daily run so a restart doesn't repeat it
 MARKER = Path(__file__).parent / ".auto_last_run"
@@ -21,7 +23,7 @@ def log(msg):
 
 
 def daily_due(now):
-    if now.weekday() >= 5 or now.hour != RUN_HOUR:
+    if now.weekday() >= 5 or now.hour < RUN_HOUR:
         return False
     done = MARKER.read_text().strip() if MARKER.exists() else ""
     return done != now.date().isoformat()
@@ -53,12 +55,11 @@ def _personalise():
 def _send():
     import sender
     sender.run()
-    return f"{db.sent_today()} of {config.DAILY_LIMIT} sent today"
+    return f"{db.sent_today()} of {config.daily_limit()} sent today"
 
 
 def _inbox():
-    import inbox
-    return f"{inbox.check_once()} replies handled"
+    return f"{inbox.checked(inbox.check_once)} replies handled"
 
 
 def daily_run(now):
@@ -70,7 +71,7 @@ def daily_run(now):
 
 
 def run():
-    log(f"auto started: daily run on weekdays at {RUN_HOUR}:00 Nairobi time, "
+    log(f"auto started: daily run on weekdays from {RUN_HOUR}:00 Nairobi time, "
         f"inbox every {config.POLL_MINUTES} min. Ctrl+C to stop.")
     while True:
         now = datetime.now(NAIROBI)

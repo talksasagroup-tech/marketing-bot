@@ -2,6 +2,7 @@
 import email
 import html as html_lib
 import imaplib
+import json
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -151,6 +152,13 @@ def since_first_send():
         return None
     d = date.fromisoformat(first) - timedelta(days=1)
     return f"{d.day:02d}-{MONTHS[d.month - 1]}-{d.year}"
+
+
+def delivery_report(headers):
+    """Whether a message is a mail server's delivery report (RFC 3464), whatever address it
+    came from (bounces@..., a provider's own name): multipart/report, report-type delivery-status."""
+    return (headers.get_content_type() == "multipart/report"
+            and str(headers.get_param("report-type") or "").lower() == "delivery-status")
 
 
 def find_original_recipient(msg):
@@ -310,7 +318,7 @@ def check_message(box, uid, key, subjects, catch_up, newly_skipped):
     None if it was skipped (added to newly_skipped when it should never be looked at again)."""
     # Look at the headers only. BODY.PEEK never marks the mail as read.
     _, head = box.uid("fetch", uid,
-                      "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)])")
+                      "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES CONTENT-TYPE)])")
     if not head or not isinstance(head[0], tuple):
         return None
     headers = email.message_from_bytes(head[0][1])
@@ -320,7 +328,7 @@ def check_message(box, uid, key, subjects, catch_up, newly_skipped):
             newly_skipped.append(key)  # the same email, already stored from another folder
         return None
     sender = parseaddr(headers.get("From", ""))[1].lower()
-    is_bounce = sender.startswith(BOUNCE_SENDERS)
+    is_bounce = sender.startswith(BOUNCE_SENDERS) or delivery_report(headers)
     lead = db.find_lead_by_email(sender) or (None if is_bounce else thread_lead(headers))
     colleagues = [] if lead or is_bounce else colleague_leads(sender)
     to_us = not is_bounce and answers_our_email(
@@ -396,11 +404,56 @@ def check_message(box, uid, key, subjects, catch_up, newly_skipped):
     return result
 
 
+# After this many failed checks in a row you get one Telegram alert (and one more when the
+# checks work again), so replies don't wait unseen while the mailbox can't be reached.
+FAILURES_BEFORE_ALERT = 3
+# The latest failure while checks are failing, for the CRM's health strip; removed once a
+# check works. A file, like last_check.txt, so it shows even when the database is the problem.
+ERROR_FILE = Path(__file__).parent / "inbox_error.txt"
+_failures = 0
+
+
+def checked(check):
+    """Run one inbox check (check_once) and keep count of failures in a row. Raises what
+    the check raised, so the caller still sees it."""
+    global _failures
+    try:
+        n = check()
+    except Exception as e:
+        _failures += 1
+        error = f"{type(e).__name__}: {str(e)[:300]}"
+        ERROR_FILE.write_text(json.dumps({"at": datetime.now().isoformat(timespec="seconds"),
+                                          "error": error, "failures": _failures}))
+        if _failures == FAILURES_BEFORE_ALERT:
+            try:
+                notify.send(f"⚠️ LeadBot couldn't check the inbox {_failures} times in a row "
+                            f"({error}). Replies wait until it works again.")
+            except Exception:
+                pass  # Telegram may be down for the same reason; the dashboard shows it too
+        raise
+    if _failures >= FAILURES_BEFORE_ALERT:
+        try:
+            notify.send(f"✅ LeadBot is checking the inbox again after {_failures} failed checks.")
+        except Exception:
+            pass
+    _failures = 0
+    ERROR_FILE.unlink(missing_ok=True)
+    return n
+
+
+def last_error():
+    """{"at", "error", "failures"} while inbox checks are failing, else None."""
+    try:
+        return json.loads(ERROR_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def watch():
     print(f"Watching inbox every {config.POLL_MINUTES} min. Ctrl+C to stop.")
     while True:
         try:
-            n = check_once()
+            n = checked(check_once)
             if n:
                 print(f"Handled {n} replies.")
         except Exception as e:

@@ -142,6 +142,13 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .chip.neg { background: var(--neg-bg); color: var(--neg); }
 .chip.pri { background: var(--primary-soft); color: var(--primary); }
 .chip.plain::before { display: none; }
+.health { flex: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 20px 0; }
+.health .chip { height: 24px; padding: 0 9px; font-size: 12px; }
+.d-next { padding: 8px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; flex: none; }
+.d-next .input, .d-next .select { height: 28px; font-size: 12.5px; width: auto; }
+.d-next .input.grow { flex: 1; min-width: 160px; }
+.d-next .lbl { color: var(--fg-3); }
+.m-head .select.label-pick { width: auto; height: 22px; font-size: 11.5px; padding: 0 4px; }
 
 /* CRM layout */
 .view { flex: 1; min-height: 0; display: flex; overflow-y: auto; }
@@ -455,6 +462,7 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
       <button class="navlink" data-go="mine"><svg class="i"><use href="#i-user"/></svg>My leads<span class="badge soft" id="nb-mine" hidden></span></button>
       <button class="navlink" data-go="closed"><svg class="i"><use href="#i-archive"/></svg>Won and lost</button>
       <button class="navlink" data-go="orgs"><svg class="i"><use href="#i-building"/></svg>Organisations</button>
+      <button class="navlink" data-go="review" id="nav-review" hidden><svg class="i"><use href="#i-check"/></svg>To review<span class="badge" id="nb-review" hidden></span></button>
     </nav>
   </div>
   <div>
@@ -492,6 +500,7 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
 
     <div class="view" id="v-leads">
       <header class="hello" id="hello" hidden><p class="date" id="hello-date"></p><h1 id="hello-text"></h1></header>
+      <div class="health" id="health" hidden aria-label="Bot health"></div>
       <div class="tiles" id="tiles">
         <button class="tile" data-t="all"><span class="ic"><svg class="i"><use href="#i-inbox"/></svg></span><div><b id="t-open">–</b><span class="l">Open leads</span></div></button>
         <button class="tile" data-t="waiting"><span class="ic"><svg class="i"><use href="#i-send"/></svg></span><div><b id="t-waiting">–</b><span class="l">Waiting on us</span></div></button>
@@ -600,6 +609,14 @@ td .acts { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; 
       </div>
     </div>
 
+    <div class="view" id="v-review" hidden>
+      <div class="page" style="max-width:1100px">
+        <div><h1>To review</h1>
+          <p class="lead">New leads found by web search. The search only guesses what kind of organisation each one is, so check it and pick its industry: a lead is emailed only once you approve it. "Not a fit" keeps it from being emailed or found again.</p></div>
+        <div id="rev-body"><p class="muted">Loading…</p></div>
+      </div>
+    </div>
+
     <div class="view" id="v-account" hidden>
       <div class="page" style="max-width:640px">
         <div><h1>My account</h1><p class="lead" id="acct-lead"></p></div>
@@ -683,15 +700,15 @@ $("theme").onclick = () => {
 
 /* ---------------- navigation ---------------- */
 const TITLES = { open: "Open leads", mine: "My leads", closed: "Won and lost", orgs: "Organisations", report: "What's working",
-                 team: "Team", templates: "Email templates", account: "My account" };
+                 team: "Team", templates: "Email templates", account: "My account", review: "To review" };
 function go(view, opts = {}) {
-  if (["team", "report", "templates"].includes(view) && state.me?.role !== "admin") view = "open";
+  if (["team", "report", "templates", "review"].includes(view) && state.me?.role !== "admin") view = "open";
   if (state.view === "templates" && view !== "templates" && tplDirty() && !confirm("Your template changes aren't saved. Leave them?")) return;
   state.view = view;
   if (opts.filter) state.filter = opts.filter;  // a summary card picks the list it shows
   $("v-leads").hidden = !LIST_VIEWS.includes(view);
   $("v-team").hidden = view !== "team"; $("v-account").hidden = view !== "account"; $("v-report").hidden = view !== "report";
-  $("v-templates").hidden = view !== "templates";
+  $("v-templates").hidden = view !== "templates"; $("v-review").hidden = view !== "review";
   document.querySelectorAll("[data-go]").forEach(b => b.dataset.go === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
   $("crumb").textContent = TITLES[view];
   $("subtabs").hidden = view !== "open";
@@ -702,6 +719,7 @@ function go(view, opts = {}) {
   if (view === "team") loadTeam();
   if (view === "report") loadReport();
   if (view === "templates") loadTemplates();
+  if (view === "review") loadReview();
   if (view === "account") $("acct-lead").textContent = `${state.me.name} · ${state.me.email} · ${state.me.role === "admin" ? "Admin" : "Sales"}`;
   if (!$("v-leads").hidden) { if (!opts.keepSel) { state.sel = null; state.detail = null; } loadLeads(); }
 }
@@ -912,6 +930,7 @@ function updateBadges() {
   const c = state.counts;
   $("nb-open").textContent = c.waiting || ""; $("nb-open").hidden = !c.waiting;
   $("nb-mine").textContent = c.mine || ""; $("nb-mine").hidden = !c.mine;
+  $("nb-review").textContent = c.review || ""; $("nb-review").hidden = !c.review;
   $("n-waiting").textContent = c.waiting ?? "";
   $("n-unclaimed").textContent = c.unclaimed ?? "";
   for (const k of ["open", "waiting", "unclaimed", "mine"]) $("t-" + k).textContent = c[k] ?? "–";
@@ -963,7 +982,7 @@ function renderList() {
     <button class="row" data-id="${l.id}" ${l.id === state.sel ? 'aria-current="true"' : ""}>
       <span class="l1">${l.waiting ? '<span class="dot" title="Waiting for an answer"></span>' : ""}<b class="truncate">${esc(l.company || l.email)}</b>
         <span class="when">${esc(when(l.last_received))}</span></span>
-      <span class="l3">${scoreHTML(l.score)}${chip(STAGES, l.status)}${l.can_email ? "" : '<span class="chip neg plain">Can\'t be emailed</span>'}
+      <span class="l3">${scoreHTML(l.score)}${chip(STAGES, l.status)}${l.can_email ? "" : '<span class="chip neg plain">Can\'t be emailed</span>'}${dueHTML(l)}
         <span class="truncate" style="margin-left:auto">${l.owner ? (l.mine ? "You" : esc(l.owner)) : "Unclaimed"}</span></span>
     </button>`).join("");
 }
@@ -973,6 +992,13 @@ $("q").addEventListener("input", renderList);
 $("owner-f").addEventListener("change", renderList);
 $("stage-f").addEventListener("change", renderList);
 $("ind-f").addEventListener("change", renderList);
+// "Due" or "Overdue" for a next step whose day has come
+function dueHTML(l) {
+  if (!l.due || !l.next_action_due) return "";
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Nairobi" });
+  const late = l.next_action_due < today;
+  return `<span class="chip ${late ? "neg" : "warn"} plain" title="${esc(l.next_action || "")}">${late ? "Overdue" : "Due today"}</span>`;
+}
 const ownerText = (l) => l.owner ? (l.mine ? "You" : esc(l.owner)) : "Unclaimed";
 function orgRow(l) {
   return `
@@ -1001,7 +1027,7 @@ function fillOrgFilters() {
 function openLead(id) {
   saveDraft();
   state.sel = id; state.detail = null; state.replyTo = null; state.mode = "reply";
-  state.composerOpen = false; state.expanded = new Set(); state.scrolledFor = null;
+  state.composerOpen = false; state.expanded = new Set(); state.scrolledFor = null; state.editNext = null; state.losing = null;
   renderList(); setHash(); renderDetail(); loadDetail(id);
 }
 async function loadDetail(id, { quiet } = {}) {
@@ -1063,6 +1089,7 @@ function renderDetail() {
       <div class="d-id"><h2 class="truncate" title="${esc(nameTip)}">${esc(name)}</h2><div class="d-meta">${meta}</div>${score}</div>
       <div class="d-actions">${owner}${buttons}${stageSel}</div>
     </div>
+    ${lostHTML()}${nextHTML(lead, can_act && can_reply && !viewOnly())}
     <div class="d-main">
       <div class="d-body"><div class="thread">${thread.length ? thread.map((m, i) => msgHTML(m, i, i >= fullFrom, i === newest)).join("") : `<p class="muted">Nothing in this conversation yet.</p>`}</div></div>
       ${composerHTML(lead, can_reply, can_act)}
@@ -1076,6 +1103,28 @@ function renderDetail() {
   else if (state.scrollEnd || !top) body.scrollTop = body.scrollHeight;
   else body.scrollTop = top.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 16;
   state.scrolledFor = state.sel; state.scrollEnd = false;
+}
+// Next step: what to do for this lead and when. Editable by whoever may act on the lead.
+function nextHTML(lead, canEdit) {
+  if (state.editNext === state.sel && canEdit) {
+    return `<div class="d-next"><span class="lbl">Next step</span>
+      <input class="input grow" id="next-text" maxlength="200" placeholder="e.g. Call Mary about pricing" value="${esc(lead.next_action || "")}">
+      <input class="input" id="next-due" type="date" value="${esc(lead.next_action_due || "")}" aria-label="Due date">
+      <button class="btn primary sm" data-a="next-save">Save</button><button class="btn ghost sm" data-a="next-cancel">Cancel</button></div>`;
+  }
+  if (!lead.next_action) return canEdit ? `<div class="d-next"><button class="btn ghost sm" data-a="next-edit">+ Add a next step</button></div>` : "";
+  return `<div class="d-next"><span class="lbl">Next step</span><b style="font-weight:500">${esc(lead.next_action)}</b>
+    ${lead.next_action_due ? `<span class="muted">· ${esc(new Date(lead.next_action_due + "T00:00:00").toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }))}</span>` : ""}${dueHTML(lead)}
+    ${canEdit ? `<button class="btn ghost sm" data-a="next-edit" style="margin-left:auto">Change</button><button class="btn ghost sm" data-a="next-clear">Done</button>` : ""}</div>`;
+}
+// Why the lead was lost: asked before a lead is marked lost
+function lostHTML() {
+  if (state.losing !== state.sel) return "";
+  const reasons = state.detail.lost_reasons || {};
+  return `<div class="d-next"><span class="lbl">Why was it lost?</span>
+    <select class="select" id="lost-reason" aria-label="Reason">${Object.entries(reasons).map(([k, t]) => `<option value="${k}">${esc(t)}</option>`).join("")}</select>
+    <input class="input grow" id="lost-note" maxlength="200" placeholder="A few words (needed for Other)">
+    <button class="btn primary sm" data-a="lost-save">Mark lost</button><button class="btn ghost sm" data-a="lost-cancel">Cancel</button></div>`;
 }
 // Room under the conversation for the open composer, so the last message can scroll above it
 function padForComposer() {
@@ -1152,7 +1201,11 @@ function msgHTML(m, i, full, newest) {
   if (m.kind === "in") {
     const waiting = !m.handled && m.label !== "bounce";  // every reply but a bounce needs reading
     const actions = state.detail.can_act ? `<div class="m-foot">${state.detail.can_reply && !viewOnly() ? `<button class="btn sm" data-a="reply-to" data-id="${m.id}">Reply to this</button>` : ""}${waiting ? `<button class="btn ghost sm" data-a="done" data-id="${m.id}"><svg class="i"><use href="#i-check"/></svg>Mark done</button>` : ""}</div>` : "";
-    return `<article class="msg in ${newest ? "newest" : ""}"><div class="m-head"><b title="${esc(m.from || m.who)}">${esc(senderOf(m.from || m.who))}</b>${waiting ? '<span class="chip pri plain">Waiting</span>' : ""}${when_}</div>
+    const labels = state.detail.labels || {};
+    const label = m.label in labels && state.detail.can_act && !viewOnly()
+      ? `<select class="select label-pick" data-a="label" data-id="${m.id}" aria-label="Label" title="Wrong label? Pick the right one">${Object.entries(labels).map(([k, t]) => `<option value="${k}" ${k === m.label ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>`
+      : m.label ? chip(LABELS, m.label) : "";
+    return `<article class="msg in ${newest ? "newest" : ""}"><div class="m-head"><b title="${esc(m.from || m.who)}">${esc(senderOf(m.from || m.who))}</b>${label}${waiting ? '<span class="chip pri plain">Waiting</span>' : ""}${when_}</div>
       ${m.subject ? `<div class="m-subj">${esc(m.subject)}</div>` : ""}${bodyHTML(m, key, full)}${actions}</article>`;
   }
   const who = m.kind === "bot" ? `LeadBot <span class="muted">· ${m.step > 1 ? "follow-up " + (m.step - 1) : "first email"}</span>` : esc(m.who) + (m.to ? ` <span class="muted">to ${esc(m.to)}</span>` : "");
@@ -1252,11 +1305,27 @@ $("detail").addEventListener("click", async (e) => {
   if (a === "c-close") { closeComposer(); return; }
   if (a === "unattach") { const k = state.sel + ":" + state.mode; saveDraft(); (state.files[k] || []).splice(+b.dataset.i, 1); renderDetail(); return; }
   if (a === "reply-to") { state.replyTo = +b.dataset.id; openComposer("reply"); return; }
+  if (a === "next-edit") { saveDraft(); state.editNext = id; renderDetail(); $("next-text")?.focus(); return; }
+  if (a === "next-cancel") { saveDraft(); state.editNext = null; renderDetail(); return; }
+  if (a === "lost-cancel") { saveDraft(); state.losing = null; renderDetail(); return; }
   b.disabled = true;
   try {
     if (a === "claim") await act(() => api(`/api/crm/leads/${id}/claim`, { method: "POST" }), "Lead claimed. It's yours.");
     if (a === "release") await act(() => api(`/api/crm/leads/${id}/release`, { method: "POST" }), "Lead released.");
     if (a === "done") await act(() => api(`/api/crm/replies/${b.dataset.id}/done`, { method: "POST" }), "Marked done.");
+    if (a === "next-save") {
+      const action = $("next-text").value.trim(), due = $("next-due").value;
+      if (!action) { toast("Write the next step first.", true); return; }
+      await act(() => api(`/api/crm/leads/${id}/next`, { method: "POST", body: { action, due: due || null } }), "Next step saved.");
+      state.editNext = null;
+    }
+    if (a === "next-clear") await act(() => api(`/api/crm/leads/${id}/next`, { method: "POST", body: { action: "" } }), "Next step done.");
+    if (a === "lost-save") {
+      const reason = $("lost-reason").value, note = $("lost-note").value.trim();
+      if (reason === "other" && !note) { toast("Write a few words on why it was lost.", true); return; }
+      await act(() => api(`/api/crm/leads/${id}/status`, { method: "POST", body: { status: "lost", reason, note } }), "Marked lost.");
+      state.losing = null;
+    }
     if (a === "save-note") {
       const text = $("c-text").value.trim(); if (!text) { toast("Write the note first.", true); return; }
       await act(() => api(`/api/crm/leads/${id}/notes`, { method: "POST", body: { body: text } }), "Note saved.");
@@ -1293,9 +1362,13 @@ $("detail").addEventListener("change", async (e) => {
   const s = e.target.closest("select[data-a]"); if (!s) return;
   const id = state.sel;
   try {
-    if (s.dataset.a === "stage" && ["client", "lost"].includes(s.value)) {
+    if (s.dataset.a === "stage" && s.value === "lost") { saveDraft(); state.losing = id; renderDetail(); $("lost-reason")?.focus(); return; }
+    if (s.dataset.a === "label") {
+      await act(() => api(`/api/crm/replies/${s.dataset.id}/label`, { method: "POST", body: { label: s.value } }), "Label corrected.");
+    }
+    if (s.dataset.a === "stage" && s.value === "client") {
       const name = state.detail.lead.company || state.detail.lead.email;
-      if (!confirm(`Mark ${name} as ${s.value === "client" ? "a client (won)" : "lost"}? Its replies are marked done and it moves to Won and lost.`)) {
+      if (!confirm(`Mark ${name} as a client (won)? Its replies are marked done and it moves to Won and lost.`)) {
         renderDetail(); return;  // puts the stage picker back
       }
     }
@@ -1331,13 +1404,31 @@ function repTable(title, note, items, minSample) {
       <td><span class="rate ${i.small_sample ? "small" : ""}"><span class="tnum">${pct(i.reply_rate)}</span><span class="track"><i style="width:${Math.round(100 * (i.reply_rate || 0) / max)}%"></i></span>${i.small_sample ? `<span class="small-note">too few to judge</span>` : ""}</span></td>
       <td class="tnum">${i.interested}</td><td class="tnum">${i.meetings}</td><td class="tnum">${i.clients}</td></tr>`).join("")}</tbody></table></div></div>`;
 }
+function lostTable(items) {
+  if (!items || !items.length) return "";
+  const total = items.reduce((n, i) => n + i.n, 0);
+  return `<div class="panel"><h3>Why leads were lost</h3><p class="lead2">From the reason picked when a lead is marked lost. All time.</p><div class="tablewrap"><table>
+    <thead><tr><th>Reason</th><th>Leads</th><th>Share</th></tr></thead>
+    <tbody>${items.map(i => `<tr><td>${esc(i.name)}</td><td class="tnum">${i.n}</td><td class="tnum">${pct(Math.round(1000 * i.n / total) / 10)}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+function searchTable(items, minSample) {
+  if (!items || !items.length) return "";
+  return `<div class="panel"><h3>Web searches</h3><p class="lead2">Every lead each search found, emailed or not. Keep the searches whose leads are usable; drop the ones that mostly find dead addresses or the wrong kind of organisation (discover.py, QUERIES).</p><div class="tablewrap"><table>
+    <thead><tr><th>Search</th><th>Found</th><th>Usable</th><th>Invalid</th><th>Not a fit</th><th>Bounced</th><th>Emailed</th><th>Replied</th><th>Interested</th></tr></thead>
+    <tbody>${items.map(i => `<tr><td style="white-space:normal;max-width:320px"><b style="font-weight:500">${esc(i.name)}</b></td>
+      <td class="tnum">${i.found}</td>
+      <td><span class="rate ${i.small_sample ? "small" : ""}"><span class="tnum">${pct(i.usable_rate)}</span>${i.small_sample ? `<span class="small-note">too few to judge</span>` : ""}</span></td>
+      <td class="tnum">${i.invalid}</td><td class="tnum">${i.rejected}</td><td class="tnum">${i.bounced}</td>
+      <td class="tnum">${i.emailed}</td><td class="tnum">${i.replied}</td><td class="tnum">${i.interested}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
 async function loadReport() {
   const days = $("rep-days").value;
   try {
     const d = await api("/api/crm/report?days=" + days);
     if ($("rep-days").value !== days) return;
     const t = d.total;
-    if (!t.emailed) { $("rep-body").innerHTML = `<div class="empty"><b>Nothing emailed in this period</b>Results show here once the bot has sent emails.</div>`; return; }
+    if (!t.emailed) { $("rep-body").innerHTML = `<div class="empty"><b>Nothing emailed in this period</b>Results show here once the bot has sent emails.</div>
+      <div style="display:grid;gap:16px">${searchTable(d.searches)}</div>`; return; }
     $("rep-body").innerHTML = `
       <div class="rep-sum" style="margin-bottom:20px">
         <div class="panel kpi"><span>Organisations emailed</span><b>${t.emailed}</b></div>
@@ -1350,10 +1441,74 @@ async function loadReport() {
         ${repTable("By industry", "", d.groups.segment)}
         ${d.has_scores ? repTable("By need score", "If the scoring works, higher bands should reply more. If they don't, the rules need changing.", d.groups.score) : `<div class="panel"><h3>By need score</h3><p class="lead2" style="padding-bottom:14px">No scores yet. They appear once the targeting step has scored your leads.</p></div>`}
         ${d.has_source ? repTable("By where the lead came from", "", d.groups.source) : ""}
+        ${lostTable(d.lost_reasons)}
+        ${searchTable(d.searches)}
       </div>`;
   } catch (e) { $("rep-body").innerHTML = `<div class="empty"><b>Couldn't load the report</b>${esc(e.message)}</div>`; }
 }
 $("rep-days").addEventListener("change", loadReport);
+
+/* ---------------- bot health (admin) ---------------- */
+async function loadHealth() {
+  if (state.me?.role !== "admin") return;
+  try {
+    const d = await api("/api/crm/health"), lv = { ok: "pos", warn: "warn", bad: "neg" };
+    $("health").innerHTML = d.items.map(i => `<span class="chip ${lv[i.level] || ""}" title="${esc(i.detail || "")}">${esc(i.text)}</span>`).join("");
+    $("health").hidden = !d.items.length;
+  } catch (e) { $("health").hidden = true; }
+}
+
+/* ---------------- to review (admin) ---------------- */
+const rev = { leads: [], industries: [], sites: {} };
+const industryName = (n) => (n || "").replace(/_/g, " ");
+async function loadReview() {
+  try {
+    const d = await api("/api/crm/review");
+    rev.leads = d.leads; rev.industries = d.industries;
+    renderReview();
+  } catch (e) { $("rev-body").innerHTML = `<div class="empty"><b>Couldn't load the leads to review</b>${esc(e.message)}</div>`; }
+}
+function industryOptions(current) {
+  const opt = (i) => `<option value="${esc(i.name)}" ${i.name === current ? "selected" : ""}>${esc(industryName(i.name))}</option>`;
+  const ok = rev.industries.filter(i => i.approved), other = rev.industries.filter(i => !i.approved);
+  return `<optgroup label="Emailed (approved)">${ok.map(opt).join("")}</optgroup>
+    <optgroup label="Not emailed yet">${other.map(opt).join("")}</optgroup>`;
+}
+function renderReview() {
+  if (!rev.leads.length) { $("rev-body").innerHTML = `<div class="empty"><b>Nothing to review</b>Leads found by web search show up here.</div>`; return; }
+  $("rev-body").innerHTML = `<div class="panel"><div class="tablewrap"><table>
+    <thead><tr><th>Organisation</th><th>Found by</th><th>Industry</th><th></th></tr></thead>
+    <tbody>${rev.leads.map(l => `<tr data-id="${l.id}">
+      <td><div class="truncate"><b style="font-weight:500">${esc(l.company)}</b>
+        <div class="muted" style="font-size:12.5px">${l.website ? `<a href="https://${esc(l.website)}" target="_blank" rel="noopener noreferrer">${esc(l.website)}</a> · ` : ""}${esc(l.email)}
+        ${l.free_mail ? ' <span class="chip warn plain">Personal address</span>' : ""}${l.status === "new" ? ' <span class="chip plain">Not verified yet</span>' : ""}</div>
+        ${rev.sites[l.id] != null ? `<p class="muted" style="font-size:12.5px;margin-top:6px;max-width:520px;white-space:normal">${esc(rev.sites[l.id] || "The website couldn't be read.")}</p>`
+          : `<button class="btn ghost sm" data-r="site" style="margin-top:4px">What do they do?</button>`}</div></td>
+      <td class="muted" style="font-size:12.5px;white-space:normal;max-width:220px">${esc(l.source_query || "")}<br>${esc(when(l.found_at))}</td>
+      <td><select class="select" data-r="industry" aria-label="Industry" style="width:auto;height:30px">${industryOptions(l.industry)}</select></td>
+      <td><div class="acts"><button class="btn primary sm" data-r="approve">Approve</button><button class="btn sm" data-r="reject">Not a fit</button></div></td>
+    </tr>`).join("")}</tbody></table></div></div>`;
+}
+$("rev-body").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-r]"); if (!b) return;
+  const tr = b.closest("tr"), id = +tr.dataset.id, lead = rev.leads.find(l => l.id === id);
+  b.disabled = true;
+  try {
+    if (b.dataset.r === "site") {
+      b.textContent = "Reading their website…";
+      const d = await act(() => api(`/api/crm/review/${id}/site`));
+      rev.sites[id] = (d.text || "").slice(0, 600);
+    } else {
+      const industry = tr.querySelector("select[data-r=industry]").value;
+      const approve = b.dataset.r === "approve";
+      await act(() => api(`/api/crm/review/${id}`, { method: "POST", body: { decision: approve ? "approve" : "reject", industry } }),
+        approve ? `${lead.company} approved as ${industryName(industry)}.` : `${lead.company} won't be emailed.`);
+      rev.leads = rev.leads.filter(l => l.id !== id);
+      refreshCounts();
+    }
+  } catch (err) {}
+  renderReview();
+});
 
 /* ---------------- team ---------------- */
 function genPassword() {
@@ -1461,7 +1616,8 @@ async function refreshAll(manual) {
   if (state.busy) return;
   const t = $("c-text"), picked = (state.files[state.sel + ":" + state.mode] || []).length;
   if (!manual && ((t && t.value.trim()) || $("c-subj")?.value.trim() || picked)) { refreshCounts(); return; } // don't disturb someone writing
-  if (!$("v-leads").hidden) await loadLeads(); else { refreshCounts(); if (state.view === "team") loadTeam(); if (state.view === "report") loadReport(); }
+  loadHealth();
+  if (!$("v-leads").hidden) await loadLeads(); else { refreshCounts(); if (state.view === "team") loadTeam(); if (state.view === "report") loadReport(); if (state.view === "review") loadReview(); }
 }
 function greet() {  // sales only: admins have it on the dashboard
   const h = new Date().getHours(), first = (state.me.name || "").trim().split(/\s+/)[0];
@@ -1476,9 +1632,10 @@ async function start() {
   state.me = me.user; state.dryRun = me.dry_run; state.fromEmail = me.from_email || ""; state.senderName = me.sender_name || me.user.name;
   $("me-name").textContent = me.user.name; $("me-av").textContent = initials(me.user.name);
   $("me-role").textContent = me.user.role === "admin" ? "Admin" : "Sales";
-  $("nav-team").hidden = $("nav-dash").hidden = $("nav-report").hidden = $("nav-templates").hidden = me.user.role !== "admin";
+  $("nav-team").hidden = $("nav-dash").hidden = $("nav-report").hidden = $("nav-templates").hidden = $("nav-review").hidden = me.user.role !== "admin";
   $("drybar").hidden = !me.dry_run;
   greet();
+  loadHealth();
   await loadUsers();
   const [v, sel] = location.hash.slice(1).split("/");
   if (v === "templates" && sel) tpl.name = sel;  // #templates/sacco opens that industry's template

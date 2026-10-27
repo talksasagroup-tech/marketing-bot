@@ -10,7 +10,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
@@ -69,14 +69,22 @@ CREATE TABLE IF NOT EXISTS leads (
     scored_at TEXT,
     -- when someone first emailed this lead from the CRM: the bot sends it nothing more
     -- (no first email, no follow-ups) from then on
-    crm_emailed_at TEXT
+    crm_emailed_at TEXT,
+    -- a person's check before the first email, for leads found by web search (their industry
+    -- is only the search that found them): 'pending' (not emailed until checked), 'approved'
+    -- or 'rejected' (not a fit). NULL = no check needed (CSV and directory imports).
+    review_status TEXT,
+    reviewed_by INTEGER,
+    reviewed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS sent (
     id INTEGER PRIMARY KEY,
     lead_id INTEGER REFERENCES leads(id),
     message_id TEXT,
     template TEXT,
+    -- the Nairobi date it went out (today()), and the UTC time
     sent_on TEXT DEFAULT (date('now')),
+    sent_at TEXT,
     -- exactly what went out: the subject and the plain-text body
     sent_subject TEXT,
     sent_body TEXT
@@ -112,6 +120,14 @@ CREATE INDEX IF NOT EXISTS lead_events_lead ON lead_events (lead_id);
 CREATE TABLE IF NOT EXISTS suppression (
     email TEXT PRIMARY KEY,
     domain TEXT,
+    reason TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+-- companies that asked us to stop: no address on their own domain is emailed or added again.
+-- Only opt-outs from a company's own domain (never free mail like gmail.com); a bounce only
+-- stops its own address.
+CREATE TABLE IF NOT EXISTS suppressed_domains (
+    domain TEXT PRIMARY KEY,
     reason TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -309,6 +325,7 @@ def init():
         c.executescript(SCHEMA)
         # Databases made before these columns existed: add them, leave the rows alone
         for table, col, kind in (("sent", "sent_subject", "TEXT"), ("sent", "sent_body", "TEXT"),
+                                 ("sent", "sent_at", "TEXT"),
                                  ("leads", "opener", "TEXT"), ("leads", "use_case", "TEXT"), ("leads", "subject_topic", "TEXT"),
                                  ("leads", "uses", "TEXT"),
                                  ("leads", "confidence", "REAL"), ("leads", "est_year", "INTEGER"),
@@ -321,7 +338,9 @@ def init():
                                  ("leads", "phone", "TEXT"), ("leads", "physical_address", "TEXT"),
                                  ("leads", "date_licensed", "TEXT"), ("leads", "imported_at", "TEXT"),
                                  ("leads", "scored_at", "TEXT"), ("leads", "source_email", "TEXT"),
-                                 ("leads", "crm_emailed_at", "TEXT"), ("replies", "message_id", "TEXT")):
+                                 ("leads", "crm_emailed_at", "TEXT"), ("replies", "message_id", "TEXT"),
+                                 ("leads", "review_status", "TEXT"), ("leads", "reviewed_by", "INTEGER"),
+                                 ("leads", "reviewed_at", "TEXT")):
             if col not in columns(c, table):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
         # Leads from before these existed
@@ -335,19 +354,59 @@ def log_event(c, lead_id, event_type, **detail):
     c.execute("INSERT INTO lead_events (lead_id, event_type, detail) VALUES (?,?,?)",
               (lead_id, event_type, json.dumps(detail, ensure_ascii=False) if detail else None))
 
+def today():
+    """Today's date in Nairobi, "YYYY-MM-DD": the day the daily limit, follow-up timing and
+    the charts all count in, whatever time zone the computer is set to."""
+    return datetime.now(config.NAIROBI).date().isoformat()
+
+# Free-mail providers: an address on one of these is a person's, not a company's
+FREE_MAIL = {"gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "hotmail.com",
+             "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
+             "protonmail.com", "proton.me", "zoho.com", "mail.com", "gmx.com"}
+
+def domain_of(email):
+    return (email or "").lower().strip().rsplit("@", 1)[-1]
+
 def _suppress(c, email, reason):
     email = email.lower().strip()
     c.execute("INSERT INTO suppression (email, domain, reason) VALUES (?,?,?) ON CONFLICT DO NOTHING",
-              (email, email.rsplit("@", 1)[-1], reason))
+              (email, domain_of(email), reason))
+    # an organisation that asked to stop is asked nothing more, at any of its addresses
+    if reason == "unsubscribed" and domain_of(email) not in FREE_MAIL:
+        c.execute("INSERT INTO suppressed_domains (domain, reason) VALUES (?,?) ON CONFLICT DO NOTHING",
+                  (domain_of(email), f"{email} unsubscribed"))
 
 def is_suppressed(email):
+    """Whether this exact address is on the suppression list."""
     with conn() as c:
         return c.execute("SELECT 1 FROM suppression WHERE email=?",
                          (email.lower().strip(),)).fetchone() is not None
 
+BLOCKED_SQL = ("SELECT 1 FROM suppression WHERE email=?"
+               " UNION ALL SELECT 1 FROM suppressed_domains WHERE domain=?")
+
+def _blocked(c, email):
+    email = (email or "").lower().strip()
+    return c.execute(BLOCKED_SQL, (email, domain_of(email))).fetchone() is not None
+
+def blocked(email):
+    """Whether this address must never be emailed or added: it is suppressed itself, or its
+    organisation's domain is."""
+    with conn() as c:
+        return _blocked(c, email)
+
 def suppressed_emails():
     with conn() as c:
         return {r[0] for r in c.execute("SELECT email FROM suppression")}
+
+def suppressed_domains():
+    with conn() as c:
+        return {r[0] for r in c.execute("SELECT domain FROM suppressed_domains")}
+
+def blocker():
+    """A check like blocked(), for many addresses at once: reads the lists once."""
+    emails, domains = suppressed_emails(), suppressed_domains()
+    return lambda email: (email or "").lower().strip() in emails or domain_of(email) in domains
 
 def unsubscribe(email):
     """Opt an address out for good, whether or not it is a lead."""
@@ -357,17 +416,22 @@ def unsubscribe(email):
     with conn() as c:
         _suppress(c, email, "unsubscribed")
 
-def add_lead(company, website, industry, email, source=None, source_query=None, source_url=None):
-    """Returns True if the lead is new. An address on the suppression list is never added."""
+# A lead in one of these review states is never emailed by the bot
+NOT_REVIEWED = ("pending", "rejected")
+
+def add_lead(company, website, industry, email, source=None, source_query=None, source_url=None,
+             review_status=None):
+    """Returns True if the lead is new. An address on the suppression list is never added.
+    review_status 'pending' holds the lead until a person checks it in the CRM."""
     email = email.lower().strip()
     with conn() as c:
-        if c.execute("SELECT 1 FROM suppression WHERE email=?", (email,)).fetchone():
+        if _blocked(c, email):
             return False
         added = c.execute(
             "INSERT INTO leads (company, website, industry, email, source, source_query,"
-            " source_url, discovered_at) VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
+            " source_url, review_status, discovered_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
             " ON CONFLICT DO NOTHING RETURNING id",
-            (company, website, industry, email, source, source_query, source_url),
+            (company, website, industry, email, source, source_query, source_url, review_status),
         ).fetchone()
         if not added:
             return False
@@ -427,9 +491,9 @@ def record_sent(lead_id, message_id, template, subject=None, body=None, subject_
     transaction, so the email counts once towards the daily limit."""
     with conn() as c:
         c.execute("DELETE FROM send_claims WHERE lead_id=?", (lead_id,))
-        sent_id = c.execute("INSERT INTO sent (lead_id, message_id, template, sent_subject, sent_body)"
-                            " VALUES (?,?,?,?,?) RETURNING id",
-                            (lead_id, message_id, template, subject, body)).fetchone()[0]
+        sent_id = c.execute("INSERT INTO sent (lead_id, message_id, template, sent_subject, sent_body,"
+                            " sent_on, sent_at) VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP) RETURNING id",
+                            (lead_id, message_id, template, subject, body, today())).fetchone()[0]
         step = c.execute("SELECT COUNT(*) FROM sent WHERE lead_id=?", (lead_id,)).fetchone()[0]
         # the campaign is the niche template the email was built from
         log_event(c, lead_id, "email_sent", sent_id=sent_id, step=step, subject=subject,
@@ -533,8 +597,7 @@ def emailed_lead_ids():
 
 def sent_today():
     with conn() as c:
-        return c.execute("SELECT COUNT(*) FROM sent WHERE sent_on=?",
-                         (date.today().isoformat(),)).fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM sent WHERE sent_on=?", (today(),)).fetchone()[0]
 
 # --- Sending safely with more than one run (G-03, G-04) ---
 
@@ -568,30 +631,43 @@ def claim_send(lead_id, followup, daily_limit, owner=None):
     (or being emailed), and today's sends plus emails in flight under the daily limit.
     followup is 0 for a first email, else the follow-up's number."""
     step = int(followup) + 1
-    today = date.today().isoformat()  # the same day sent_today counts
+    day = today()  # the same day sent_today counts
     with immediate() as c:
-        lead = c.execute("SELECT email, status, crm_emailed_at FROM leads WHERE id=?", (lead_id,)).fetchone()
+        lead = c.execute("SELECT email, status, crm_emailed_at, review_status FROM leads WHERE id=?",
+                         (lead_id,)).fetchone()
         if not lead:
             return "no such lead"
+        if lead["review_status"] in NOT_REVIEWED:
+            return f"review is {lead['review_status']}: a person hasn't approved this lead in the CRM"
         if lead["crm_emailed_at"]:
             return "someone at TalkSasa has emailed this lead from the CRM"
         wanted = "sent" if followup else "verified"
         if lead["status"] != wanted:
             return f"status is now {lead['status']}, not {wanted}"
-        if c.execute("SELECT 1 FROM suppression WHERE email=?", (lead["email"].lower().strip(),)).fetchone():
+        if _blocked(c, lead["email"]):
             return "on the suppression list"
         emailed = c.execute("SELECT COUNT(*) FROM sent WHERE lead_id=?", (lead_id,)).fetchone()[0]
         if emailed != step - 1:
             return f"{emailed} emails already sent"
         if c.execute("SELECT 1 FROM send_claims WHERE lead_id=?", (lead_id,)).fetchone():
             return "already being sent by another run, or left over from a run that stopped mid-send"
-        used = (c.execute("SELECT COUNT(*) FROM sent WHERE sent_on=?", (today,)).fetchone()[0]
-                + c.execute("SELECT COUNT(*) FROM send_claims WHERE claimed_on=?", (today,)).fetchone()[0])
+        used = (c.execute("SELECT COUNT(*) FROM sent WHERE sent_on=?", (day,)).fetchone()[0]
+                + c.execute("SELECT COUNT(*) FROM send_claims WHERE claimed_on=?", (day,)).fetchone()[0])
         if used >= daily_limit:
             return f"daily limit of {daily_limit} reached"
         c.execute("INSERT INTO send_claims (lead_id, step, claimed_on, owner) VALUES (?,?,?,?)",
-                  (lead_id, step, today, owner))
+                  (lead_id, step, day, owner))
     return None
+
+# A lead whose email failed this many times is not tried again by the bot (a mail server that
+# keeps refusing it would otherwise take a slot every day). Its failures stay in lead_events.
+MAX_SEND_FAILURES = 3
+
+def failure_counts():
+    """{lead id: how many times an email to it failed to go out}."""
+    with conn() as c:
+        return {r[0]: r[1] for r in c.execute(
+            "SELECT lead_id, COUNT(*) FROM lead_events WHERE event_type='send_failed' GROUP BY lead_id")}
 
 def release_claim(lead_id):
     """The email did not go out: free the claim so the lead can be tried again."""

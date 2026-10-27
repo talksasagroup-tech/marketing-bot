@@ -84,7 +84,8 @@ def all_data():
             if r["received_at"] and "T" not in r["received_at"]:
                 r["received_at"] = r["received_at"].replace(" ", "T") + "Z"
 
-        start = (date.today() - timedelta(days=29)).isoformat()
+        today = date.fromisoformat(db.today())  # the bot's own day, as it counts the daily limit
+        start = (today - timedelta(days=29)).isoformat()
         sent_by_day = {r["d"]: r["n"] for r in c.execute(
             "SELECT s.sent_on d, COUNT(*) n FROM sent s LEFT JOIN leads l ON l.id = s.lead_id"
             f" WHERE s.sent_on >= ? AND {db.real('l')} GROUP BY s.sent_on", (start,))}
@@ -96,7 +97,7 @@ def all_data():
                GROUP BY d""", (start,))}
         daily = []
         for i in range(29, -1, -1):
-            d = (date.today() - timedelta(days=i)).isoformat()
+            d = (today - timedelta(days=i)).isoformat()
             daily.append({"day": d, "sent": sent_by_day.get(d, 0), "replies": rep_by_day.get(d, 0)})
 
         status_counts = {r["status"]: r["n"] for r in c.execute(
@@ -123,33 +124,9 @@ def all_data():
         "leads": leads, "replies": replies, "daily": daily,
         "statusCounts": status_counts, "niches": niches,
         # the bot's own count against its daily limit, so emails to manual leads are in it
-        "bot": {"last_check": last_check, "daily_limit": config.DAILY_LIMIT,
+        "bot": {"last_check": last_check, "daily_limit": config.daily_limit(),
                 "sent_today": db.sent_today()},
     }
-
-
-@app.get("/api/leads/{lead_id}/emails")
-def lead_emails(lead_id: int):
-    """Everything sent to one lead and every reply from it, oldest first."""
-    with conn() as c:
-        if not c.execute("SELECT 1 FROM leads WHERE id = ?", (lead_id,)).fetchone():
-            raise HTTPException(404, "Lead not found")
-        cols = columns(c, "sent")
-        step = "step" if "step" in cols else "ROW_NUMBER() OVER (ORDER BY id)"
-        # Subject and body are null for emails sent before the bot kept copies
-        subject = "sent_subject" if "sent_subject" in cols else "NULL"
-        body = "sent_body" if "sent_body" in cols else "NULL"
-        sent = [dict(r) for r in c.execute(f"""
-            SELECT {step} AS step, sent_on, {subject} AS sent_subject, {body} AS sent_body
-            FROM sent WHERE lead_id = ? ORDER BY id""", (lead_id,))]
-        replies = [dict(r) for r in c.execute("""
-            SELECT id, received_at, label, summary, body
-            FROM replies WHERE lead_id = ? ORDER BY id""", (lead_id,))]
-    for r in replies:
-        r["summary"] = screen_text(r["summary"])
-        if r["received_at"] and "T" not in r["received_at"]:
-            r["received_at"] = r["received_at"].replace(" ", "T") + "Z"
-    return {"lead_id": lead_id, "sent": sent, "replies": replies}
 
 
 class Handled(BaseModel):

@@ -1,5 +1,6 @@
 """All settings come from the .env file. Copy .env.example to .env and fill it in."""
 import os
+from datetime import timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,7 +20,21 @@ SMTP_USER = env("SMTP_USER")
 SMTP_PASS = env("SMTP_PASS")
 FROM_NAME = env("FROM_NAME", "TalkSasa")
 FROM_EMAIL = env("FROM_EMAIL", SMTP_USER)
-DAILY_LIMIT = int(env("DAILY_LIMIT", "25"))         # start low, raise slowly
+# The day every count is kept in ("today" for the daily limit, follow-up timing, charts)
+NAIROBI = timezone(timedelta(hours=3))  # Kenya has no daylight saving
+DAILY_LIMIT = int(env("DAILY_LIMIT", "10"))         # start low, raise slowly
+# DAILY_LIMIT is held to MAX_DAILY_LIMIT unless DAILY_LIMIT_OVERRIDE=true, so a typo or a
+# forgotten one-off change in .env can't raise the agreed volume
+MAX_DAILY_LIMIT = 10
+DAILY_LIMIT_OVERRIDE = env("DAILY_LIMIT_OVERRIDE", "false").strip().lower() == "true"
+
+
+def daily_limit():
+    """The most emails the bot sends in one day: DAILY_LIMIT, at most MAX_DAILY_LIMIT
+    unless DAILY_LIMIT_OVERRIDE is on."""
+    return DAILY_LIMIT if DAILY_LIMIT_OVERRIDE else min(DAILY_LIMIT, MAX_DAILY_LIMIT)
+
+
 SEND_DELAY_SECONDS = int(env("SEND_DELAY_SECONDS", "90"))  # gap between emails
 # First emails go to the highest need score first (targeting.py); a lead scored below
 # MIN_SCORE, or not scored yet, is left waiting. Follow-ups don't depend on it.

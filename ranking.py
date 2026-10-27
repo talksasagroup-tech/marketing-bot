@@ -24,9 +24,7 @@ COPYRIGHT_RANGE = re.compile(r"(?:©|\(c\)|copyright)[\s©]*(?:copyright\s*)?" +
 # Niches that send messages constantly
 BUSY_NICHES = {"fintech", "microfinance", "sacco", "ecommerce", "delivery_app", "saas",
                "healthtech", "logistics_tech", "transport", "school"}
-FREE_MAIL = {"gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "hotmail.com",
-             "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
-             "protonmail.com", "proton.me", "zoho.com", "mail.com", "gmx.com"}
+FREE_MAIL = db.FREE_MAIL
 
 
 def believable(year):
@@ -134,12 +132,17 @@ def waiting():
     targeting.py; not scored yet comes last), then the points above, then oldest-found first. An address on the suppression list is never waiting,
     whatever its score, and neither is a lead that has already been emailed, even if
     its status was set back to verified: a first email is never sent twice. A lead someone
-    has emailed from the CRM is left to them."""
-    suppressed = db.suppressed_emails()
+    has emailed from the CRM is left to them, and one found by web search waits until a
+    person approves it in the CRM (review_status). A lead whose email failed to go out before
+    comes after the ones that haven't failed, so it can't hold up the day's sending."""
+    is_blocked = db.blocker()
     emailed = db.emailed_lead_ids()
+    failures = db.failure_counts()
     leads = [l for l in db.leads_by_status("verified")
-             if l["email"] not in suppressed and l["id"] not in emailed and not l["crm_emailed_at"]]
-    return sorted(leads, key=lambda l: (-(need_score(l) if need_score(l) is not None else -1),
+             if not is_blocked(l["email"]) and l["id"] not in emailed and not l["crm_emailed_at"]
+             and l["review_status"] not in db.NOT_REVIEWED]
+    return sorted(leads, key=lambda l: (failures.get(l["id"], 0) > 0,
+                                        -(need_score(l) if need_score(l) is not None else -1),
                                         -score(l), l["id"]))
 
 

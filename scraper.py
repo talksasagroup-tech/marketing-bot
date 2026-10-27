@@ -146,7 +146,7 @@ def run(csv_path):
             continue
         emails = scrape_site(site)
         best = pick_best(emails)
-        if best and db.is_suppressed(best):
+        if best and db.blocked(best):
             print(f"[{i}/{len(rows)}] {name}: {best} is on the suppression list")
             continue
         print(f"[{i}/{len(rows)}] {name}: {best or 'no email found'}")

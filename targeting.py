@@ -254,6 +254,8 @@ def import_lenders(src=CBK_DCP_URL, source=CBK_DCP_SOURCE, source_url=CBK_DCP_UR
             lead = c.execute("SELECT email FROM leads WHERE id=?", (lead_id,)).fetchone()
         email = lead["email"]
         ok = bool(verify.SYNTAX.match(email)) and verify.domain_ok(domain_of(email))
+        if ok is None:  # DNS didn't answer: left new, so `main.py verify` checks it again
+            continue
         db.set_status(lead_id, "verified" if ok else "invalid", "verify")
         if not ok:
             invalid.append(lead_id)

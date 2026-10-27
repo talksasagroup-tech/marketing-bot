@@ -181,6 +181,15 @@ def ensure_schema():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_crm_attachments_lead ON crm_attachments(lead_id);
+        -- every change a person made to a reply's label, so the AI's first answer is never lost
+        CREATE TABLE IF NOT EXISTS reply_labels (
+            id INTEGER PRIMARY KEY,
+            reply_id INTEGER NOT NULL REFERENCES replies(id),
+            old_label TEXT,
+            new_label TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         -- one-time data changes, so each runs once and never undoes what people did since
         CREATE TABLE IF NOT EXISTS crm_migrations (
             name TEXT PRIMARY KEY,
@@ -192,6 +201,10 @@ def ensure_schema():
             c.execute("ALTER TABLE leads ADD COLUMN claimed_by INTEGER")
         if "claimed_at" not in lc:
             c.execute("ALTER TABLE leads ADD COLUMN claimed_at TEXT")
+        # the next thing to do for a lead and the day it's due; why a lost lead was lost
+        for col in ("next_action", "next_action_due", "lost_reason"):
+            if col not in lc:
+                c.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
         if "handled" not in _cols(c, "replies"):
             c.execute("ALTER TABLE replies ADD COLUMN handled INTEGER DEFAULT 0")
         # Every reply but a bounce now needs someone to read it. Replies an older version marked
@@ -483,7 +496,7 @@ def _lead_or_404(c, lead_id, user):
 
 # What sales see of a lead; admins see every column
 SALES_FIELDS = ("id", "company", "email", "phone", "industry", "website", "score", "status",
-                "claimed_by", "claimed_at", "created_at")
+                "claimed_by", "claimed_at", "created_at", "next_action", "next_action_due", "lost_reason")
 
 
 def _has_response(c, lead_id):
@@ -496,7 +509,7 @@ NOT_YET = "This organisation hasn't replied yet, so nobody can claim it. You can
 
 
 def _can_email(c, lead):
-    return lead["status"] not in NO_EMAIL and not db.is_suppressed(lead["email"] or "")
+    return lead["status"] not in NO_EMAIL and not db.blocked(lead["email"] or "")
 
 
 def _score_cols(c):
@@ -542,8 +555,8 @@ def open_leads(scope: str = "open", user=Depends(current_user)):
     no_email = ",".join("'%s'" % s for s in NO_EMAIL)
     waiting = "COALESCE(r.handled,0) = 0 AND COALESCE(r.label,'') != 'bounce'"   # every reply but a bounce
     me = int(user["id"])
-    if scope == "closed":
-        where = f"l.status IN ('client','lost')"
+    if scope == "closed":  # a lead rejected in review was never a deal: it isn't shown as lost
+        where = "l.status IN ('client','lost') AND COALESCE(l.review_status, '') != 'rejected'"
     elif scope == "mine":  # every lead you're handling, whether or not it has written back
         where = MINE
     else:
@@ -554,12 +567,13 @@ def open_leads(scope: str = "open", user=Depends(current_user)):
         where += " AND l.claimed_by = %d" % me
     elif user["role"] != "admin":
         where += " AND (l.claimed_by IS NULL OR l.claimed_by = %d)" % me
-    suppressed = db.suppressed_emails()
+    is_blocked = db.blocker()
     with conn() as c:
         names = _user_names(c)
         sc = _score_cols(c)
         rows = [dict(r) for r in c.execute(f"""
             SELECT l.id, l.company, l.email, l.industry, l.status, l.website, l.claimed_by, l.claimed_at,
+                   l.next_action, l.next_action_due,
                    {('l.' + sc['score']) if sc['score'] else 'NULL'} AS score,
                    (SELECT COUNT(*) FROM replies r WHERE r.lead_id = l.id AND {waiting}) AS waiting,
                    CASE WHEN l.status IN ({no_email}) THEN 0 ELSE 1 END AS can_email,
@@ -579,17 +593,23 @@ def open_leads(scope: str = "open", user=Depends(current_user)):
             r["claimed_at"] = iso(r["claimed_at"])
             r["owner"] = names.get(r["claimed_by"])
             r["mine"] = r["claimed_by"] == user["id"]
-            r["can_email"] = bool(r["can_email"]) and (r["email"] or "").lower().strip() not in suppressed
+            r["can_email"] = bool(r["can_email"]) and not is_blocked(r["email"])
+            r["due"] = _due(r)
             del r["last_reply_id"]
         mine = c.execute(f"SELECT COUNT(*) FROM leads l WHERE {MINE} AND l.claimed_by = ?", (me,)).fetchone()[0]
-    # Waiting on us first, newest reply first
+        review = c.execute(f"SELECT COUNT(*) FROM leads WHERE review_status = 'pending' AND status IN"
+                           f" ({','.join('?' * len(REVIEWABLE))})", REVIEWABLE).fetchone()[0]
+    # Waiting on us first, then next steps due today or overdue, newest reply first
     rows.sort(key=lambda r: r["last_received"] or "", reverse=True)
-    rows.sort(key=lambda r: r["waiting"] == 0)
+    rows.sort(key=lambda r: (r["waiting"] == 0, not r["due"]))
     counts = {"open": len(rows),
               # waiting on us: an email to answer, or nobody has the lead yet (e.g. it was released)
               "waiting": sum(1 for r in rows if r["waiting"] or not r["claimed_by"]),
               "unclaimed": sum(1 for r in rows if not r["claimed_by"]),
-              "mine": mine}  # the same leads My leads shows
+              "mine": mine,  # the same leads My leads shows
+              "due": sum(1 for r in rows if r["due"] and r["mine"])}  # your next steps due today or overdue
+    if user["role"] == "admin":
+        counts["review"] = review  # new leads waiting for an admin's check (To review)
     return {"leads": rows, "counts": counts, "me": user["id"]}
 
 
@@ -602,7 +622,7 @@ def organisations(user=Depends(current_user)):
              "(SELECT 1 FROM crm_messages m WHERE m.lead_id = l.id AND m.status != 'failed'))")
     if user["role"] != "admin":
         where += " AND (l.claimed_by IS NULL OR l.claimed_by = %d)" % int(user["id"])
-    suppressed = db.suppressed_emails()
+    is_blocked = db.blocker()
     with conn() as c:
         names = _user_names(c)
         sc = _score_cols(c)
@@ -622,7 +642,7 @@ def organisations(user=Depends(current_user)):
     for r in rows:
         r["emails"] = r.pop("bot_emails") + r.pop("team_emails")
         r["last_emailed"] = max(filter(None, (r.pop("last_bot"), (r.pop("last_team") or "")[:10])), default=None)
-        r["can_email"] = bool(r["can_email"]) and (r["email"] or "").lower().strip() not in suppressed
+        r["can_email"] = bool(r["can_email"]) and not is_blocked(r["email"])
         r["owner"] = names.get(r["claimed_by"])
         r["mine"] = r["claimed_by"] == user["id"]
     rows.sort(key=lambda r: (r["last_emailed"] or "", r["id"]), reverse=True)  # most recently emailed first
@@ -677,7 +697,9 @@ def lead_detail(lead_id: int, user=Depends(current_user)):
     lead["mine"] = lead.get("claimed_by") == user["id"]
     lead["claimed_at"] = iso(lead.get("claimed_at"))
     lead["created_at"] = iso(lead.get("created_at"))
+    lead["due"] = _due(lead)
     return {"lead": lead, "thread": items, "events": events, "can_reply": can_reply,
+            "lost_reasons": LOST_REASONS, "labels": CORRECTABLE_LABELS,
             "can_act": user["role"] == "admin" or not lead.get("claimed_by") or lead["mine"],
             "can_download": user["role"] == "admin" or lead["mine"],
             "has_response": has_response}
@@ -759,6 +781,23 @@ def add_note(lead_id: int, body: NoteIn, user=Depends(current_user)):
 
 class StatusIn(BaseModel):
     status: str
+    reason: Optional[str] = None   # why a lead was lost: a key of LOST_REASONS
+    note: Optional[str] = None     # the words for "other"
+
+
+# Why a deal was lost, so the report can show what to fix
+LOST_REASONS = {"not_interested": "Not interested", "has_provider": "Already has an SMS provider",
+                "price": "Price or no budget", "wrong_fit": "Not a fit for SMS", "no_response": "Stopped responding",
+                "other": "Other"}
+
+
+def _lost_reason(body):
+    if body.reason not in LOST_REASONS:
+        raise HTTPException(400, "Say why the lead was lost.")
+    note = " ".join((body.note or "").split())[:200]
+    if body.reason == "other" and not note:
+        raise HTTPException(400, "Write a few words on why the lead was lost.")
+    return f"other: {note}" if body.reason == "other" else body.reason
 
 
 @router.post("/api/crm/leads/{lead_id}/status")
@@ -768,6 +807,7 @@ def crm_status(lead_id: int, body: StatusIn, user=Depends(current_user)):
     with conn() as c:
         lead = _lead_or_404(c, lead_id, user)
         _require_owner_or_free(lead, user)
+        reason = _lost_reason(body) if body.status == "lost" else None
         if lead["status"] in ("unsubscribed", "bounced"):
             raise HTTPException(409, "This lead unsubscribed or bounced, so its stage can't change here.")
         responded = _has_response(c, lead_id)
@@ -782,9 +822,90 @@ def crm_status(lead_id: int, body: StatusIn, user=Depends(current_user)):
                 c.execute(f"UPDATE leads SET {body.status}_at = COALESCE({body.status}_at, ?) WHERE id = ?",
                           (now_utc(), lead_id))
             db.log_event(c, lead_id, "status_changed", old=lead["status"], new=body.status, by="crm")
+        c.execute("UPDATE leads SET lost_reason = ? WHERE id = ?", (reason, lead_id))
         if body.status in WON_OR_LOST:
             c.execute("UPDATE replies SET handled = 1 WHERE lead_id = ?", (lead_id,))
-        log_event(c, lead_id, user["id"], "stage", body.status)
+        log_event(c, lead_id, user["id"], "stage", body.status + (f" ({reason})" if reason else ""))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- next step
+
+def _due(lead):
+    """Whether the lead's next step is due today or overdue (Nairobi's today, as the bot counts it)."""
+    return bool(lead.get("next_action_due")) and lead["next_action_due"] <= db.today()
+
+
+class NextIn(BaseModel):
+    action: str = ""               # empty clears the next step
+    due: Optional[str] = None      # YYYY-MM-DD
+
+
+@router.post("/api/crm/leads/{lead_id}/next")
+def set_next(lead_id: int, body: NextIn, user=Depends(current_user)):
+    """What to do next for a lead and when, e.g. "Call Mary about pricing" on 2026-11-03."""
+    action = " ".join(body.action.split())
+    if len(action) > 200:
+        raise HTTPException(400, "Keep the next step under 200 characters.")
+    due = (body.due or "").strip() or None
+    if due:
+        try:
+            datetime.strptime(due, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "Pick a date for the next step.")
+    if not action:
+        due = None
+    with conn() as c:
+        lead = _lead_or_404(c, lead_id, user)
+        _require_owner_or_free(lead, user)
+        if not lead["claimed_by"] and user["role"] != "admin" and not _has_response(c, lead_id):
+            raise HTTPException(409, NOT_YET)
+        c.execute("UPDATE leads SET next_action = ?, next_action_due = ? WHERE id = ?", (action or None, due, lead_id))
+        log_event(c, lead_id, user["id"], "next_step", f"{action} (due {due})" if action and due else action or "cleared")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- correcting a reply's label
+# The AI's label decides what is alerted and what the report counts as interested, so a person
+# can put it right. Opt-outs and bounces aren't changed here: they decide who may be emailed at
+# all and come only from the rules (classifier.opt_out) and delivery reports.
+
+CORRECTABLE_LABELS = {"interested": "Interested", "question": "Question", "not_interested": "Not interested",
+                      "out_of_office": "Auto-reply", "needs_review": "Needs review"}
+
+
+class LabelIn(BaseModel):
+    label: str
+
+
+@router.post("/api/crm/replies/{reply_id}/label")
+def correct_label(reply_id: int, body: LabelIn, user=Depends(current_user)):
+    import inbox
+    if body.label not in CORRECTABLE_LABELS:
+        raise HTTPException(400, "Unknown label.")
+    with conn() as c:
+        r = c.execute("SELECT lead_id, label FROM replies WHERE id = ?", (reply_id,)).fetchone()
+        if not r or (r["lead_id"] is None and user["role"] != "admin"):
+            raise HTTPException(404, "Reply not found.")
+        lead = None
+        if r["lead_id"] is not None:
+            lead = _lead_or_404(c, r["lead_id"], user)
+            _require_owner_or_free(lead, user)
+        if r["label"] in ("bounce", "unsubscribe"):
+            raise HTTPException(409, "Bounces and unsubscribes can't be relabelled here: they decide who may be emailed.")
+        if r["label"] == body.label:
+            return {"ok": True}
+        c.execute("UPDATE replies SET label = ? WHERE id = ?", (body.label, reply_id))
+        c.execute("INSERT INTO reply_labels (reply_id, old_label, new_label, user_id) VALUES (?,?,?,?)",
+                  (reply_id, r["label"], body.label, user["id"]))
+        log_event(c, r["lead_id"], user["id"], "label_corrected", f"{r['label']} → {body.label}")
+        if lead is not None:
+            db.log_event(c, lead["id"], "label_corrected", reply_id=reply_id, old=r["label"], new=body.label)
+    # as if the reply had come in with the right label: an auto-reply that was really a person
+    # answering moves the lead to replied, so it gets no more follow-ups
+    new_status = inbox.status_after(lead["status"], body.label) if lead is not None else None
+    if new_status:
+        db.set_status(lead["id"], new_status, "crm")
     return {"ok": True}
 
 
@@ -1279,8 +1400,181 @@ def report(days: int = 0, user=Depends(admin_only)):
         else:
             items.sort(key=lambda x: (-x["emailed"], x["name"]))  # ties by name, on any database
         out[g] = items
+    with conn() as c:
+        lost = [{"name": LOST_REASONS.get(r["reason"], "Other" if r["reason"] else "No reason given"), "n": r["n"]}
+                for r in c.execute("""SELECT CASE WHEN lost_reason LIKE 'other:%' THEN 'other' ELSE lost_reason END AS reason,
+                                             COUNT(*) AS n
+                                      FROM leads WHERE status = 'lost' AND COALESCE(review_status, '') != 'rejected'
+                                      GROUP BY 1 ORDER BY n DESC""")]
     return {"total": finish(total), "groups": out, "days": days, "min_sample": MIN_SAMPLE,
-            "has_scores": bool(sc["score"]), "has_source": bool(sc["source"])}
+            "has_scores": bool(sc["score"]), "has_source": bool(sc["source"]),
+            "searches": _search_results(since), "lost_reasons": lost}
+
+
+def _search_key(query):
+    """Searches grouped the way they are written in discover.QUERIES: the town each run picks
+    is put back as {town}, and a company found on a list page counts under that list's site."""
+    import discover
+    query = query or "(no search recorded)"
+    if query.startswith("listed on "):
+        return "listed on " + discover.domain_of(query.removeprefix("listed on "))
+    for town in discover.TOWNS:
+        query = re.sub(rf"\b{re.escape(town)}\b", "{town}", query)
+    return query
+
+
+def _search_results(since):
+    """For each web search: what it found and what became of those leads, counted from every
+    lead it found (not only the emailed ones), so a search that finds dead addresses or
+    wrong-fit organisations stands out. since: first found on or after this date."""
+    with conn() as c:
+        rows = c.execute("""
+            SELECT l.id, l.source_query, l.status, l.review_status,
+                   EXISTS (SELECT 1 FROM sent s WHERE s.lead_id = l.id) AS emailed,
+                   EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id
+                           AND r.label NOT IN ('bounce','out_of_office')) AS replied,
+                   EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = l.id AND r.label = 'interested') AS interested
+            FROM leads l
+            WHERE l.source = 'search' AND COALESCE(l.discovered_at, l.created_at) >= ?""", (since,)).fetchall()
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(_search_key(r["source_query"]), {
+            "found": 0, "invalid": 0, "rejected": 0, "emailed": 0, "bounced": 0, "replied": 0, "interested": 0})
+        g["found"] += 1
+        g["invalid"] += r["status"] == "invalid"
+        g["rejected"] += r["review_status"] == "rejected"
+        g["emailed"] += bool(r["emailed"])
+        g["bounced"] += r["status"] == "bounced"
+        g["replied"] += bool(r["replied"])
+        g["interested"] += bool(r["interested"]) or r["status"] in ("meeting", "client")
+    out = []
+    for name, g in groups.items():
+        usable = g["found"] - g["invalid"] - g["rejected"] - g["bounced"]
+        out.append(dict(g, name=name, usable_rate=round(100 * usable / g["found"], 1),
+                        small_sample=g["found"] < MIN_SAMPLE))
+    return sorted(out, key=lambda x: (-x["found"], x["name"]))
+
+
+# ---------------------------------------------------------------- is the bot healthy? (admin)
+
+def _minutes_since(path):
+    try:
+        return (time.time() - path.stat().st_mtime) / 60
+    except OSError:
+        return None
+
+
+@router.get("/api/crm/health")
+def health(admin=Depends(admin_only)):
+    """One line per thing that can quietly stop the bot, each "ok", "warn" or "bad", so "nothing
+    happened today" can be told apart from "something broke"."""
+    import inbox
+    import sender
+    items = []
+    age, error = _minutes_since(HERE / "last_check.txt"), inbox.last_error()
+    if error:
+        items.append({"key": "inbox", "level": "bad", "text": f"Inbox checks failing ({error['failures']} in a row)",
+                      "detail": error["error"]})
+    elif age is None:
+        items.append({"key": "inbox", "level": "warn", "text": "Inbox never checked", "detail": "Start the bot: python start.py"})
+    else:
+        stale = age > max(20, config.POLL_MINUTES * 4)
+        items.append({"key": "inbox", "level": "bad" if age > 24 * 60 else "warn" if stale else "ok",
+                      "text": f"Inbox checked {int(age)} min ago" if age < 120 else f"Inbox last checked {int(age // 60)} h ago",
+                      "detail": "Replies wait until the bot checks again." if stale else ""})
+    gate = sender.bounce_gate()
+    items.append({"key": "bounces", "level": "bad" if gate else "ok",
+                  "text": "Sending paused: too many bounces" if gate else "Bounce rate fine", "detail": gate or ""})
+    sent, limit = db.sent_today(), config.daily_limit()
+    items.append({"key": "sent", "level": "ok", "text": f"{sent} of {limit} sent today", "detail": ""})
+    claims = db.send_claims()
+    if claims:
+        items.append({"key": "claims", "level": "bad", "text": f"{len(claims)} send left unfinished",
+                      "detail": "A send stopped mid-email: " + ", ".join(r["email"] or "?" for r in claims)
+                                + ". Check the Sent folder, then delete the row from send_claims."})
+    due = len(sender.followups_due())
+    if due:
+        items.append({"key": "followups", "level": "ok", "text": f"{due} follow-up{'s' if due != 1 else ''} due", "detail": ""})
+    with conn() as c:
+        pending = c.execute(f"SELECT COUNT(*) FROM leads WHERE review_status = 'pending' AND status IN"
+                            f" ({','.join('?' * len(REVIEWABLE))})", REVIEWABLE).fetchone()[0]
+    if pending:
+        items.append({"key": "review", "level": "warn", "text": f"{pending} new lead{'s' if pending != 1 else ''} to review",
+                      "detail": "They aren't emailed until you approve them."})
+    return {"items": items}
+
+
+# ---------------------------------------------------------------- review new leads (admin)
+# Leads found by web search are held (review_status 'pending') until an admin confirms what
+# kind of organisation they are, since the search that found them is only a guess: a hotel
+# found by a church search would otherwise get the church email.
+
+REVIEWABLE = ("new", "verified")  # pending leads with a dead address aren't worth a look
+
+
+@router.get("/api/crm/review")
+def review_queue(admin=Depends(admin_only)):
+    import personalise
+    with conn() as c:
+        rows = [dict(r) for r in c.execute(f"""
+            SELECT id, company, email, website, industry, status, score, source_query, source_url,
+                   COALESCE(discovered_at, created_at) AS found_at
+            FROM leads WHERE review_status = 'pending' AND status IN ({",".join("?" * len(REVIEWABLE))})
+            ORDER BY id""", REVIEWABLE)]
+    for r in rows:
+        r["found_at"] = iso(r["found_at"])
+        r["free_mail"] = db.domain_of(r["email"]) in db.FREE_MAIL
+    industries = [{"name": k, "approved": bool(v.get("approved"))}
+                  for k, v in sorted(personalise.USES.items()) if k != "default"]
+    return {"leads": rows, "industries": industries}
+
+
+@router.get("/api/crm/review/{lead_id}/site")
+def review_site(lead_id: int, admin=Depends(admin_only)):
+    """A short look at the lead's website, so its industry can be checked without leaving the CRM."""
+    import scraper
+    with conn() as c:
+        lead = _lead_or_404(c, lead_id, admin)
+    try:
+        text = scraper.site_text(lead["website"], 1500) if lead["website"] else ""
+    except Exception:
+        text = ""
+    return {"text": text}
+
+
+class ReviewIn(BaseModel):
+    decision: str            # approve / reject
+    industry: Optional[str] = None
+
+
+@router.post("/api/crm/review/{lead_id}")
+def review_lead(lead_id: int, body: ReviewIn, admin=Depends(admin_only)):
+    import personalise
+    if body.decision not in ("approve", "reject"):
+        raise HTTPException(400, "Choose approve or reject.")
+    with conn() as c:
+        lead = _lead_or_404(c, lead_id, admin)
+        if lead["review_status"] != "pending":
+            raise HTTPException(409, "This lead was already reviewed.")
+        if body.decision == "approve":
+            industry = (body.industry or "").strip()
+            if industry not in personalise.USES or industry == "default":
+                raise HTTPException(400, "Pick the organisation's industry.")
+            # scored and personalised again for its real industry before its first email
+            c.execute("""UPDATE leads SET industry = ?, review_status = 'approved', reviewed_by = ?, reviewed_at = ?,
+                         scored_at = NULL, confidence = NULL WHERE id = ?""",
+                      (industry, admin["id"], now_utc(), lead_id))
+            db.log_event(c, lead_id, "reviewed", decision="approved", industry=industry,
+                         was=lead["industry"] if lead["industry"] != industry else None)
+            log_event(c, lead_id, admin["id"], "review_approved", industry)
+        else:
+            c.execute("UPDATE leads SET review_status = 'rejected', reviewed_by = ?, reviewed_at = ? WHERE id = ?",
+                      (admin["id"], now_utc(), lead_id))
+            db.log_event(c, lead_id, "reviewed", decision="rejected")
+            log_event(c, lead_id, admin["id"], "review_rejected", "not a fit")
+    if body.decision == "reject":
+        db.set_status(lead_id, "lost", "review")  # never emailed; kept so it isn't found and added again
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- team (admin)
